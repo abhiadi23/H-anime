@@ -1,4 +1,4 @@
 pyrofork
 TgCrypto
-selenium-wire
+selenium
 yt-dlp
