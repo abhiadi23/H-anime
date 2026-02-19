@@ -520,4 +520,3 @@ async def dl_cmd(client: Client, message: Message):
 if name == "main":
     print("[*] Bot starting...")
     app.run()
-`
