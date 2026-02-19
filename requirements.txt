@@ -1,4 +1,5 @@
-pyrofork
-TgCrypto
-selenium
-yt-dlp
+pyrogram==2.0.106
+TgCrypto==1.2.5
+playwright==1.44.0
+yt-dlp>=2024.5.1
+aiofiles>=23.2.1
