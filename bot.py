@@ -1,522 +1,369 @@
 import asyncio
-import re
+import logging
 import os
 import time
-import glob
-from config import *
+from typing import Optional
+
 from pyrogram import Client, filters
-from pyrogram.types import Message
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.chrome.options import Options
-from seleniumwire import webdriver as wire_webdriver
+from pyrogram.types import (
+    Message,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    CallbackQuery,
+)
+from pyrogram.errors import FloodWait, MessageNotModified
 
-DOWNLOAD_DIR = "./downloads"
+import config
+from scraper import scraper
+from downloader import downloader
 
-os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+logger = logging.getLogger(__name__)
 
-app = Client("hanime_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
-
-
-# ─────────────────────────────────────────────
-# STRICT URL FILTER — only CDN/video URLs
-# ─────────────────────────────────────────────
-
-# Must have one of these extensions
-VIDEO_EXTENSIONS = re.compile(
-    r'\.(m3u8|mp4|mkv|ts|m4v|webm)(\?|#|$)',
-    re.IGNORECASE
+# ------------------------------------------------------------------ #
+#  Pyrogram client                                                     #
+# ------------------------------------------------------------------ #
+app = Client(
+    "hanime_bot",
+    api_id=config.API_ID,
+    api_hash=config.API_HASH,
+    bot_token=config.BOT_TOKEN,
 )
 
-# Must come from one of these CDN domains
-CDN_DOMAINS = re.compile(
-    r'('
-    r'cdn\d*\.hanime\.tv|'
-    r'hwcdn\.net|'
-    r'storage\.googleapis\.com|'
-    r'cloudfront\.net|'
-    r'akamaized\.net|'
-    r'fastly\.net|'
-    r'b-cdn\.net|'
-    r'r\.cloudflare\.com|'
-    r'stream\.mux\.com'
-    r')',
-    re.IGNORECASE
-)
+# In-memory state: {user_id: {search_results: [...], selected_url: str, episodes: [...]}}
+user_state: dict = {}
 
 
-def is_valid_video_url(url: str) -> bool:
-    """
-    Returns True only if the URL has a video file extension
-    OR comes from a known CDN domain.
-    Filters out all analytics, JS, images, API calls, etc.
-    """
-    if not url or not url.startswith("http"):
-        return False
-    has_video_ext  = bool(VIDEO_EXTENSIONS.search(url))
-    has_cdn_domain = bool(CDN_DOMAINS.search(url))
-    return has_video_ext or has_cdn_domain
+# ------------------------------------------------------------------ #
+#  Helpers                                                             #
+# ------------------------------------------------------------------ #
+def chunk_list(lst, n):
+    for i in range(0, len(lst), n):
+        yield lst[i : i + n]
 
 
-# ─────────────────────────────────────────────
-# CHROME OPTIONS
-# ─────────────────────────────────────────────
-
-def get_chrome_options() -> Options:
-    options = Options()
-    options.add_argument("--headless=new")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--window-size=1920,1080")
-    options.add_argument("--autoplay-policy=no-user-gesture-required")
-    options.add_argument(
-        "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-    )
-    return options
+def format_bytes(size: int) -> str:
+    for unit in ["B", "KB", "MB", "GB"]:
+        if size < 1024:
+            return f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} TB"
 
 
-# ─────────────────────────────────────────────
-# SCRAPER
-# ─────────────────────────────────────────────
-
-def scrape_video_url(page_url: str) -> dict:
-    """
-    Opens the page in selenium-wire headless Chrome,
-    clicks play, then intercepts all network requests
-    and scans page source + iframes for CDN/video URLs.
-    """
-    driver = wire_webdriver.Chrome(
-        options=get_chrome_options(),
-        seleniumwire_options={"disable_encoding": True},
-    )
-
-    result = {
-        "title":         "Unknown",
-        "stream_url":    None,
-        "download_urls": [],
-        "thumbnail":     None,
-        "error":         None,
-    }
-
+async def safe_edit(msg: Message, text: str, **kwargs):
     try:
-        driver.get(page_url)
-        wait = WebDriverWait(driver, 20)
-
-        # ── Step 1: Grab title ──
-        try:
-            title_el = wait.until(
-                EC.presence_of_element_located(
-                    (By.CSS_SELECTOR, "h1, .video-title, [class*='title']")
-                )
-            )
-            result["title"] = title_el.text.strip() or driver.title
-        except Exception:
-            result["title"] = driver.title
-
-        # ── Step 2: Click play button on main page ──
-        play_selectors = [
-            ".vjs-big-play-button",
-            ".plyr__control--overlaid",
-            "button.play-button",
-
-"[class*='play-button']",
-            "[class*='PlayButton']",
-            "video",
-        ]
-        for sel in play_selectors:
-            try:
-                btn = WebDriverWait(driver, 5).until(
-                    EC.element_to_be_clickable((By.CSS_SELECTOR, sel))
-                )
-                driver.execute_script("arguments[0].click();", btn)
-                print(f"[+] Clicked play: {sel}")
-                break
-            except Exception:
-                continue
-
-        # ── Step 3: Force play via JS ──
-        try:
-            driver.execute_script(
-                "document.querySelectorAll('video')"
-                ".forEach(v => { try { v.play(); } catch(e) {} });"
-            )
-        except Exception:
-            pass
-
-        # ── Step 4: Click play inside every iframe ──
-        try:
-            iframes = driver.find_elements(By.TAG_NAME, "iframe")
-            for iframe in iframes:
-                try:
-                    driver.switch_to.frame(iframe)
-
-                    # Try clicking play inside iframe
-                    for sel in play_selectors:
-                        try:
-                            btn = WebDriverWait(driver, 3).until(
-                                EC.element_to_be_clickable((By.CSS_SELECTOR, sel))
-                            )
-                            driver.execute_script("arguments[0].click();", btn)
-                            print(f"[+] Clicked play inside iframe: {sel}")
-                            break
-                        except Exception:
-                            continue
-
-                    # Force play inside iframe too
-                    try:
-                        driver.execute_script(
-                            "document.querySelectorAll('video')"
-                            ".forEach(v => { try { v.play(); } catch(e) {} });"
-                        )
-                    except Exception:
-                        pass
-
-                    driver.switch_to.default_content()
-
-                except Exception:
-                    driver.switch_to.default_content()
-                    continue
-        except Exception:
-            pass
-
-        # ── Step 5: Wait for all network traffic to fire ──
-        time.sleep(7)
-
-        found_urls = []
-
-        # ── Step 6: Scan intercepted network requests ──
-        # selenium-wire logs every HTTP/HTTPS request Chrome made
-        # including background XHR/fetch calls from the video player JS
-        for req in driver.requests:
-            url = req.url
-            if not is_valid_video_url(url):
-                continue
-            if url in found_urls:
-                continue
-            # 200 = normal, 206 = Partial Content (normal for video streaming)
-            if req.response and req.response.status_code not in (200, 206):
-                continue
-            found_urls.append(url)
-            print(f"[+] Network request: {url}")
-
-        # ── Step 7: Scan main page source ──
-        try:
-            src = driver.page_source
-
-            # HTML attribute scan: src="...", file="...", url="..."
-            for m in re.findall(
-                r'(?:src|file|url|source)=["\']([^"\']+)["\']', src
-            ):
-                if is_valid_video_url(m) and m not in found_urls:
-                    found_urls.append(m)
-                    print(f"[+] Page source attr: {m}")
-
-            # JSON blob scan: "src": "...", "stream": "..."
-            for m in re.findall(
-                r'"(?:src|url|file|source|stream|hls|video)"\s*:\s*"(https?://[^"]+)"',
-                src
-            ):
-                if is_valid_video_url(m) and m not in found_urls:
-                    found_urls.append(m)
-                    print(f"[+] Page source JSON: {m}")
-
-        except Exception:
-            pass
-
-        # ── Step 8: Scan every iframe's source ──
-        try:
-            iframes = driver.find_elements(By.TAG_NAME, "iframe")
-            for iframe in iframes:
-                try:
-                    driver.switch_to.frame(iframe)
-                    iframe_src = driver.page_source
-
-# HTML attributes inside iframe
-                    for m in re.findall(
-                        r'(?:src|file|url|source)=["\']([^"\']+)["\']',
-                        iframe_src
-                    ):
-                        if is_valid_video_url(m) and m not in found_urls:
-                            found_urls.append(m)
-                            print(f"[+] iframe source attr: {m}")
-
-                    # JSON blobs inside iframe
-                    for m in re.findall(
-                        r'"(?:src|url|file|source|stream|hls|video)"\s*:\s*"(https?://[^"]+)"',
-                        iframe_src
-                    ):
-                        if is_valid_video_url(m) and m not in found_urls:
-                            found_urls.append(m)
-                            print(f"[+] iframe JSON: {m}")
-
-                    driver.switch_to.default_content()
-
-                except Exception:
-                    driver.switch_to.default_content()
-                    continue
-        except Exception:
-            pass
-
-        # ── Step 9: Scan anchor download tags ──
-        try:
-            for link in driver.find_elements(By.CSS_SELECTOR, "a[href], a[download]"):
-                href = link.get_attribute("href") or ""
-                if is_valid_video_url(href) and href not in found_urls:
-                    found_urls.append(href)
-                    print(f"[+] Anchor tag: {href}")
-        except Exception:
-            pass
-
-        # ── Step 10: Prioritize URLs ──
-        # m3u8 first (HLS manifest, yt-dlp picks best quality from it)
-        # then mp4, mkv, then bare CDN URLs
-        m3u8_urls = [u for u in found_urls if ".m3u8" in u.lower()]
-        mp4_urls  = [u for u in found_urls if ".mp4"  in u.lower()]
-        mkv_urls  = [u for u in found_urls if ".mkv"  in u.lower()]
-        cdn_only  = [
-            u for u in found_urls
-            if u not in m3u8_urls + mp4_urls + mkv_urls
-        ]
-
-        ordered = m3u8_urls + mp4_urls + mkv_urls + cdn_only
-
-        result["stream_url"]    = ordered[0] if ordered else None
-        result["download_urls"] = ordered
-
-        # ── Step 11: Thumbnail ──
-        try:
-            og = driver.find_element(By.CSS_SELECTOR, 'meta[property="og:image"]')
-            result["thumbnail"] = og.get_attribute("content")
-        except Exception:
-            pass
-
-    except Exception as e:
-        result["error"] = str(e)
-    finally:
-        driver.quit()
-
-    return result
+        await msg.edit_text(text, **kwargs)
+    except (MessageNotModified, FloodWait):
+        pass
 
 
-# ─────────────────────────────────────────────
-# YT-DLP DOWNLOADER
-# ─────────────────────────────────────────────
-
-async def download_with_ytdlp(
-    cdn_url: str,
-    title: str,
-    status_msg: Message,
-) -> str | None:
-    """
-    Runs yt-dlp as a subprocess to download from CDN/stream URL.
-    Streams stdout so we can update Telegram with live progress.
-    Returns the path to the downloaded file or None on failure.
-    """
-    safe_title = re.sub(r'[^\w\s-]', '', title)[:60].strip() or "video"
-    output_template = os.path.join(DOWNLOAD_DIR, f"{safe_title}.%(ext)s")
-
-    cmd = [
-        "yt-dlp",
-        cdn_url,
-        "--output", output_template,
-        "--format", "bestvideo+bestaudio/best",
-        "--merge-output-format", "mp4",
-        "--no-playlist",
-        "--retries", "5",
-        "--fragment-retries", "10",
-        "--concurrent-fragments", "4",
-        "--newline",
-        "--progress",
-        "--no-warnings",
-        "--add-header", "Referer:https://hanime.tv/",
-        "--add-header", (
-            "User-Agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-        ),
-    ]
-
-    process = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,
-    )
-
-    last_update = time.time()
-    last_line   = ""
-
-    async for raw_line in process.stdout:
-        line = raw_line.decode("utf-8", errors="ignore").strip()
-        if not line:
-            continue
-        last_line = line
-        print(f"[yt-dlp] {line}")
-
-# Update Telegram message every 5 seconds with progress
-        if "[download]" in line and time.time() - last_update > 5:
-            try:
-                await status_msg.edit_text(
-                    f"⬇️ Downloading...\n\n{line}"
-                )
-                last_update = time.time()
-            except Exception:
-                pass
-
-    await process.wait()
-
-    if process.returncode != 0:
-        print(f"[!] yt-dlp failed — last line: {last_line}")
-        return None
-
-    # Find the output file (extension may vary)
-    pattern = os.path.join(DOWNLOAD_DIR, f"{safe_title}.*")
-    files   = sorted(glob.glob(pattern), key=os.path.getmtime, reverse=True)
-    return files[0] if files else None
-
-
-# ─────────────────────────────────────────────
-# BOT COMMANDS
-# ─────────────────────────────────────────────
-
-@app.on_message(filters.command("start"))
-async def start_cmd(_, message: Message):
+# ------------------------------------------------------------------ #
+#  /start  /help                                                       #
+# ------------------------------------------------------------------ #
+@app.on_message(filters.command(["start", "help"]))
+async def cmd_start(client: Client, message: Message):
     await message.reply_text(
-        "👋 Hanime Downloader Bot\n\n"
-        "Usage:\n"
-        "/dl <hanime.tv video URL>\n\n"
-        "Example:\n"
-        "/dl https://hanime.tv/videos/hentai/some-title\n\n"
-        "What happens:\n"
-        "1. Opens page in headless Chrome\n"
-        "2. Clicks play to trigger CDN requests\n"
-        "3. Intercepts network traffic via selenium-wire\n"
-        "4. Scans page source + iframes for video URLs\n"
-        "5. Filters strictly for .m3u8 / .mp4 / .mkv / CDN domains\n"
-        "6. Downloads best quality via yt-dlp\n"
-        "7. Uploads to Telegram"
+        "🎌 **Hanime Downloader Bot**\n\n"
+        "**Commands:**\n"
+        "• `/search <name>` — Search for anime on hanime.tv\n"
+        "• `/dl <url>` — Direct download from a hanime.tv episode URL\n"
+        "• `/help` — Show this message\n\n"
+        "_After searching, pick an episode from the inline buttons and the bot "
+        "will scrape the CDN URL and download it for you._"
     )
 
 
-@app.on_message(filters.command("dl"))
-async def dl_cmd(client: Client, message: Message):
-    args = message.text.split(maxsplit=1)
-
-    if len(args) < 2:
-        await message.reply_text(
-            "❌ Please provide a URL.\n\n"
-            "Usage: /dl <hanime.tv URL>"
-        )
+# ------------------------------------------------------------------ #
+#  /search                                                             #
+# ------------------------------------------------------------------ #
+@app.on_message(filters.command("search"))
+async def cmd_search(client: Client, message: Message):
+    query = " ".join(message.command[1:]).strip()
+    if not query:
+        await message.reply_text("Usage: `/search <anime name>`")
         return
 
-    url = args[1].strip()
+    uid = message.from_user.id
+    status_msg = await message.reply_text(f"🔍 Searching for **{query}**…")
 
-    if "hanime.tv" not in url:
-        await message.reply_text("❌ Only hanime.tv URLs are supported.")
-        return
-
-    status = await message.reply_text(
-        "🌐 Opening page in headless Chrome...\n"
-        "This may take 15–30 seconds."
-    )
-
-    # ── Phase 1: Scrape ──
     try:
-        loop = asyncio.get_event_loop()
-        data = await loop.run_in_executor(None, scrape_video_url, url)
+        results = await scraper.search(query)
     except Exception as e:
-        await status.edit_text(f"❌ Scraper crashed:\n{e}")
+        logger.error(e)
+        await safe_edit(status_msg, f"❌ Search failed: {e}")
         return
 
-    if data.get("error"):
-        await status.edit_text(f"❌ Scraper error:\n{data['error']}")
+    if not results:
+        await safe_edit(status_msg, "😔 No results found. Try a different query.")
         return
 
-    stream_url = data.get("stream_url")
-    title      = data.get("title", "video")
-    all_urls   = data.get("download_urls", [])
+    user_state[uid] = {"search_results": results, "selected_url": None, "episodes": []}
 
-    if not stream_url:
-        await status.edit_text(
-            "❌ No video URL found.\n\n"
-            "The page may require login or the stream is obfuscated."
+    buttons = []
+    for i, r in enumerate(results):
+        title = r["title"][:50]
+        buttons.append([InlineKeyboardButton(f"📺 {title}", callback_data=f"series:{uid}:{i}")])
+
+    await safe_edit(
+        status_msg,
+        f"🔎 Found **{len(results)}** results for `{query}`:\n_Select a title to view episodes._",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
+# ------------------------------------------------------------------ #
+#  Callback: series selected                                           #
+# ------------------------------------------------------------------ #
+@app.on_callback_query(filters.regex(r"^series:"))
+async def cb_series(client: Client, cb: CallbackQuery):
+    _, uid_str, idx_str = cb.data.split(":")
+    uid = int(uid_str)
+    idx = int(idx_str)
+
+    if cb.from_user.id != uid:
+        await cb.answer("This is not your search!", show_alert=True)
+        return
+
+    state = user_state.get(uid)
+    if not state:
+        await cb.answer("Session expired. Run /search again.", show_alert=True)
+        return
+
+    selected = state["search_results"][idx]
+    await cb.answer()
+    await cb.message.edit_text(
+        f"⏳ Loading episodes for **{selected['title']}**…"
+    )
+
+    try:
+        episodes = await scraper.get_series_episodes(selected["url"])
+    except Exception as e:
+        logger.error(e)
+        await cb.message.edit_text(f"❌ Failed to load episodes: {e}")
+        return
+
+    if not episodes:
+        # Treat the search result itself as the only episode
+        episodes = [{"title": selected["title"], "url": selected["url"], "number": 1}]
+
+    state["episodes"] = episodes
+    state["selected_url"] = selected["url"]
+
+    buttons = []
+    for i, ep in enumerate(episodes):
+        label = ep["title"][:50] or f"Episode {ep['number'] or i+1}"
+        buttons.append(
+            [InlineKeyboardButton(f"🎬 {label}", callback_data=f"episode:{uid}:{i}")]
+        )
+    buttons.append(
+        [InlineKeyboardButton("🔙 Back to results", callback_data=f"back:{uid}")]
+    )
+
+    await cb.message.edit_text(
+        f"📋 **{selected['title']}** — {len(episodes)} episode(s):\n_Tap to download._",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
+# ------------------------------------------------------------------ #
+#  Callback: back to search results                                    #
+# ------------------------------------------------------------------ #
+@app.on_callback_query(filters.regex(r"^back:"))
+async def cb_back(client: Client, cb: CallbackQuery):
+    uid = int(cb.data.split(":")[1])
+    if cb.from_user.id != uid:
+        await cb.answer("Not your session!", show_alert=True)
+        return
+
+    state = user_state.get(uid)
+    if not state:
+        await cb.answer("Session expired. Run /search again.", show_alert=True)
+        return
+
+    results = state["search_results"]
+    buttons = []
+    for i, r in enumerate(results):
+        title = r["title"][:50]
+        buttons.append([InlineKeyboardButton(f"📺 {title}", callback_data=f"series:{uid}:{i}")])
+
+    await cb.answer()
+    await cb.message.edit_text(
+        "🔎 Search results — select a title:",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
+# ------------------------------------------------------------------ #
+#  Callback: episode selected → download                              #
+# ------------------------------------------------------------------ #
+@app.on_callback_query(filters.regex(r"^episode:"))
+async def cb_episode(client: Client, cb: CallbackQuery):
+    _, uid_str, idx_str = cb.data.split(":")
+    uid = int(uid_str)
+    idx = int(idx_str)
+
+    if cb.from_user.id != uid:
+        await cb.answer("Not your session!", show_alert=True)
+        return
+
+    state = user_state.get(uid)
+    if not state or not state.get("episodes"):
+        await cb.answer("Session expired. Run /search again.", show_alert=True)
+        return
+
+    episode = state["episodes"][idx]
+    await cb.answer()
+
+    await _download_and_send(client, cb.message, uid, episode["url"], episode["title"])
+
+
+# ------------------------------------------------------------------ #
+#  /dl — direct URL download                                          #
+# ------------------------------------------------------------------ #
+@app.on_message(filters.command("dl"))
+async def cmd_dl(client: Client, message: Message):
+    args = message.command[1:]
+    if not args:
+        await message.reply_text("Usage: `/dl <hanime.tv episode URL>`")
+        return
+
+    url = args[0].strip()
+    if "hanime.tv" not in url:
+        await message.reply_text("❌ Please provide a valid hanime.tv URL.")
+        return
+
+    title = url.split("/")[-1].replace("-", " ").title()
+    uid = message.from_user.id
+    await _download_and_send(client, message, uid, url, title)
+
+
+# ------------------------------------------------------------------ #
+#  Core: extract CDN URL → download → upload                          #
+# ------------------------------------------------------------------ #
+async def _download_and_send(
+    client: Client,
+    trigger_msg: Message,
+    uid: int,
+    page_url: str,
+    title: str,
+):
+    # Step 1: get CDN url
+    status = await trigger_msg.reply_text(
+        f"🕵️ Extracting CDN URL for **{title}**…\n_This may take ~30s_"
+    )
+
+    cdn_url = await scraper.get_cdn_url(page_url)
+
+    if not cdn_url:
+        # Let yt-dlp try to handle the page URL directly
+        logger.warning("CDN URL not found via Playwright, passing page URL to yt-dlp")
+        cdn_url = page_url
+
+    await safe_edit(status, f"⬇️ Downloading **{title}**…\n`{cdn_url[:80]}…`")
+
+    # Progress tracking
+    last_update = [time.time()]
+
+    def progress_hook(d):
+        nonlocal last_update
+        if d["status"] == "downloading":
+            now = time.time()
+            if now - last_update[0] < 5:
+                return
+            last_update[0] = now
+
+            downloaded = d.get("downloaded_bytes", 0)
+            total = d.get("total_bytes") or d.get("total_bytes_estimate", 0)
+            speed = d.get("speed", 0) or 0
+            eta = d.get("eta", 0) or 0
+
+            pct = (downloaded / total * 100) if total else 0
+            bar_len = 20
+            filled = int(bar_len * pct / 100)
+            bar = "█" * filled + "░" * (bar_len - filled)
+
+            text = (
+                f"⬇️ **Downloading:** {title}\n"
+                f"`[{bar}]` {pct:.1f}%\n"
+                f"📦 {format_bytes(downloaded)} / {format_bytes(total)}\n"
+                f"⚡ {format_bytes(int(speed))}/s  ⏱ {eta}s"
+            )
+            asyncio.run_coroutine_threadsafe(safe_edit(status, text), client.loop)
+
+    # Step 2: Download
+    file_path = await downloader.download(cdn_url, title, progress_hook)
+
+    if not file_path:
+        await safe_edit(
+            status,
+            f"❌ Download failed for **{title}**.\n"
+            "Try `/dl <url>` with the direct episode URL, or the CDN might be rate-limited.",
         )
         return
 
-    # Show what we found
-    url_type = "m3u8 (HLS)" if ".m3u8" in stream_url else \
-               "mp4" if ".mp4" in stream_url else \
-               "mkv" if ".mkv" in stream_url else "CDN stream"
+    file_size = os.path.getsize(file_path)
+    size_mb = file_size / (1024 * 1024)
 
-    found_text = "\n".join(
-        f"{i+1}. {u[:80]}{'...' if len(u) > 80 else ''}"
-        for i, u in enumerate(all_urls[:5])
-    )
-
-    await status.edit_text(
-        f"✅ Found {len(all_urls)} video URL(s)\n\n"
-        f"Title: {title}\n"
-        f"Type: {url_type}\n\n"
-        f"All found:\n{found_text}\n\n"
-        f"⬇️ Starting download..."
-    )
-
-    # ── Phase 2: Download ──
-    file_path = await download_with_ytdlp(stream_url, title, status)
-
-    if not file_path or not os.path.exists(file_path):
-        # Retry with original page URL directly
-        await status.edit_text(
-            "⚠️ CDN URL failed, retrying with page URL via yt-dlp..."
+    if size_mb > config.MAX_FILE_SIZE_MB:
+        await safe_edit(
+            status,
+            f"⚠️ File is too large ({size_mb:.1f} MB) to send via Telegram.\n"
+            f"Max allowed: {config.MAX_FILE_SIZE_MB} MB.",
         )
-        file_path = await download_with_ytdlp(url, title, status)
-
-    if not file_path or not os.path.exists(file_path):
-        await status.edit_text(
-            f"❌ Download failed.\n\n"
-            f"Stream URL (copy manually):\n{stream_url}"
-        )
+        os.remove(file_path)
         return
 
-    file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
+    await safe_edit(status, f"📤 Uploading **{title}** ({size_mb:.1f} MB)…")
 
-# ── Phase 3: Upload ──
-    await status.edit_text(
-        f"📤 Uploading {file_size_mb:.1f} MB to Telegram..."
-    )
-
+    # Step 3: Upload
     try:
         await client.send_video(
-            chat_id=message.chat.id,
+            chat_id=trigger_msg.chat.id,
             video=file_path,
-            caption=(
-                f"🎬 {title}\n\n"
-                f"📦 Size: {file_size_mb:.1f} MB\n"
-                f"🔗 Source: {url}"
-            ),
+            caption=f"🎌 **{title}**\n🔗 {page_url}",
             supports_streaming=True,
-            reply_to_message_id=message.id,
+            progress=_upload_progress,
+            progress_args=(status, title, client),
         )
         await status.delete()
-
     except Exception as e:
-        await status.edit_text(
-            f"❌ Upload failed:\n{e}\n\n"
-            f"File was downloaded but couldn't be sent."
-        )
-
+        logger.error(f"Upload error: {e}")
+        await safe_edit(status, f"❌ Upload failed: {e}")
     finally:
-        try:
+        if os.path.exists(file_path):
             os.remove(file_path)
-        except Exception:
-            pass
 
 
-# ─────────────────────────────────────────────
-# MAIN
-# ─────────────────────────────────────────────
+async def _upload_progress(current, total, status_msg, title, client):
+    pct = current / total * 100 if total else 0
+    bar_len = 20
+    filled = int(bar_len * pct / 100)
+    bar = "█" * filled + "░" * (bar_len - filled)
+    text = (
+        f"📤 **Uploading:** {title}\n"
+        f"`[{bar}]` {pct:.1f}%\n"
+        f"📦 {format_bytes(current)} / {format_bytes(total)}"
+    )
+    await safe_edit(status_msg, text)
 
-if name == "main":
-    print("[*] Bot starting...")
-    app.run()
+
+# ------------------------------------------------------------------ #
+#  Main                                                                #
+# ------------------------------------------------------------------ #
+async def main():
+    await scraper.start()
+    logger.info("Bot starting…")
+    await app.start()
+    logger.info("Bot is running. Press Ctrl+C to stop.")
+    await asyncio.Event().wait()  # keep alive
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Shutting down…")
+        asyncio.run(scraper.stop())
