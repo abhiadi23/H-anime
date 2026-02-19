@@ -175,7 +175,7 @@ async def cb_series(client: Client, cb: CallbackQuery):
 
     buttons = [
         [InlineKeyboardButton(
-            f"🎬 {ep['title'][:48] or f'Episode {ep[\"number\"] or i + 1}'}",
+            f"🎬 {ep['title'][:48]} or f'Episode {ep[\"number\"] or i + 1}'}",
             callback_data=f"episode:{uid}:{i}"
         )]
         for i, ep in enumerate(episodes)
