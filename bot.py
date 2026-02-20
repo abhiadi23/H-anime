@@ -44,9 +44,16 @@ def log(level: str, msg: str) -> None:
 VIDEO_EXT = re.compile(r'\.(m3u8|mp4|mkv|ts|m4v|webm)(\?|#|$)', re.IGNORECASE)
 
 CDN_DOMAINS = re.compile(
-    r'(cdn\d*\.hanime\.tv|hwcdn\.net|storage\.googleapis\.com|'
+    r'(cdn\d*\.hanime\.tv|hwcdn\.net|'
     r'cloudfront\.net|akamaized\.net|fastly\.net|b-cdn\.net|'
     r'videodelivery\.net|stream\.cloudflare\.com|stream\.mux\.com)',
+    re.IGNORECASE
+)
+
+# Domains that must appear in the URL for it to be considered the real video
+# (storage.googleapis.com removed — too broad, used by ads too)
+HANIME_CDN = re.compile(
+    r'(hanime\.tv|hwcdn\.net|videodelivery\.net|mux\.com)',
     re.IGNORECASE
 )
 
@@ -54,22 +61,41 @@ BLACKLIST = re.compile(
     r'(performance\.radar\.cloudflare\.com|cdnjs\.cloudflare\.com|'
     r'cdn\.jsdelivr\.net|google-analytics\.com|googletagmanager\.com|'
     r'doubleclick\.net|sentry\.io|newrelic\.com|analytics|tracking|'
-    r'telemetry|metrics|beacon|\.js(\?|$))',
+    r'telemetry|metrics|beacon|\.js(\?|$)|'
+    # Ad networks — explicitly block these CDN-looking ad domains
+    r'adtng\.com|adnxs\.com|adsrvr\.org|advertising\.com|'
+    r'ads\.yahoo\.com|moatads\.com|amazon-adsystem\.com|'
+    r'creatives\.|ad-delivery\.|adform\.net|rubiconproject\.com|'
+    r'openx\.net|pubmatic\.com|taboola\.com|outbrain\.com|'
+    r'exoclick\.com|trafficjunky\.net|traffichaus\.com|juicyads\.com|'
+    r'plugrush\.com|tsyndicate\.com|etahub\.com|realsrv\.com)',
     re.IGNORECASE
 )
 
 
 def is_cdn_video(req) -> bool:
     url = req.url
-    if not url.startswith("http") or BLACKLIST.search(url):
+    if not url.startswith("http"):
         return False
-    if not (VIDEO_EXT.search(url) or CDN_DOMAINS.search(url)):
+    if BLACKLIST.search(url):
+        return False
+    # Must have a video extension OR come from a known hanime/video CDN
+    has_video_ext = bool(VIDEO_EXT.search(url))
+    from_cdn      = bool(CDN_DOMAINS.search(url))
+    if not (has_video_ext or from_cdn):
+        return False
+    # Prefer URLs that are clearly from hanime's own CDN;
+    # for generic CDNs (cloudfront, fastly etc.) require a video extension
+    if not HANIME_CDN.search(url) and not has_video_ext:
+        return False
+    # Ad creatives often live at paths like /creatives/ or /a7/ — skip them
+    if re.search(r'/(creatives|banners?|ads?|promo)/', url, re.IGNORECASE):
         return False
     if req.response and req.response.status_code not in (200, 206):
         return False
     try:
         cl = req.response.headers.get("Content-Length") if req.response else None
-        if cl and int(cl) < 100_000:
+        if cl and int(cl) < 500_000:   # raise floor to 500 KB — ads are small
             return False
     except (ValueError, TypeError):
         pass
@@ -194,13 +220,6 @@ def force_play(driver, label: str = "main") -> None:
         log("WARN", f"JS force-play failed [{label}]: {e}")
 
 
-# ─── CDN WAIT CONDITION ───────────────────────────────────────────────────────
-
-class CDNRequestFound:
-    def __call__(self, driver):
-        return any(is_cdn_video(r) for r in driver.requests)
-
-
 # ─── SCRAPER ──────────────────────────────────────────────────────────────────
 
 def scrape_video_url(page_url: str) -> dict:
@@ -215,27 +234,16 @@ def scrape_video_url(page_url: str) -> dict:
             "Referer": "https://hanime.tv/",
         }
 
-        # Load page
+        # ── 1. Load page ──────────────────────────────────────────────────────
         driver.get(page_url)
         WebDriverWait(driver, 30).until(
             lambda d: d.execute_script("return document.readyState") == "complete"
         )
         log("INFO", f"Page loaded: {driver.title!r}")
 
-        # Wait for player element
-        for sel in ["video", ".video-js", ".plyr", "[class*='player']", "iframe[src*='embed']"]:
-            try:
-                WebDriverWait(driver, 10).until(
-                    EC.presence_of_element_located((By.CSS_SELECTOR, sel))
-                )
-                log("INFO", f"Player found: {sel!r}")
-                break
-            except Exception:
-                continue
-
-        # Title
+        # ── 2. Grab title immediately ──────────────────────────────────────────
         try:
-            el = WebDriverWait(driver, 8).until(
+            el = WebDriverWait(driver, 5).until(
                 EC.presence_of_element_located(
                     (By.CSS_SELECTOR, "h1, .video-title, [class*='title']")
                 )
@@ -244,56 +252,73 @@ def scrape_video_url(page_url: str) -> dict:
         except Exception:
             result["title"] = driver.title
 
-        # Human-like random mouse movement + scroll
-        try:
-            human_move_random(driver)
-        except Exception:
-            pass
-        time.sleep(random.uniform(1.0, 2.0))
-        driver.execute_script("window.scrollBy(0, window.innerHeight * 0.6);")
-        time.sleep(random.uniform(0.8, 1.5))
+        # Clean up the page title suffix hanime adds
+        result["title"] = re.sub(
+            r'\s*[-|]\s*hanime\.tv.*$', '', result["title"], flags=re.IGNORECASE
+        ).strip()
 
-        # Click play on main page
+        # ── 3. Wait for player, then hit play immediately ─────────────────────
+        for sel in ["video", ".video-js", ".plyr", "[class*='player']"]:
+            try:
+                WebDriverWait(driver, 8).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, sel))
+                )
+                log("INFO", f"Player found: {sel!r}")
+                break
+            except Exception:
+                continue
+
+        # Minimal human-like scroll then play — no long sleeps
+        driver.execute_script("window.scrollBy(0, window.innerHeight * 0.4);")
+        time.sleep(0.5)
         click_play(driver, label="main")
         force_play(driver, label="main")
-        time.sleep(random.uniform(1.0, 2.0))
 
-        # iframes
-        for idx, iframe in enumerate(driver.find_elements(By.TAG_NAME, "iframe")):
-            try:
-                WebDriverWait(driver, 5).until(
-                    EC.frame_to_be_available_and_switch_to_it(iframe)
-                )
-                WebDriverWait(driver, 8).until(
-                    lambda d: d.execute_script("return document.readyState") == "complete"
-                )
-                click_play(driver, label=f"iframe#{idx+1}")
-                force_play(driver, label=f"iframe#{idx+1}")
-                driver.switch_to.default_content()
-            except Exception:
-                driver.switch_to.default_content()
+        # ── 4. Poll for CDN URL — bail as soon as we find one ─────────────────
+        log("INFO", "Polling for CDN URL (up to 20s)...")
+        deadline = time.time() + 20
+        found_early = False
+        while time.time() < deadline:
+            hits = [r for r in driver.requests if is_cdn_video(r)]
+            if hits:
+                log("HIT", f"CDN URL found after {20 - (deadline - time.time()):.1f}s")
+                found_early = True
+                break
+            time.sleep(0.3)
+
+        # ── 5. Only try iframes if nothing found yet ───────────────────────────
+        if not found_early:
+            log("INFO", "No CDN on main page — trying iframes...")
+            for idx, iframe in enumerate(driver.find_elements(By.TAG_NAME, "iframe")):
+                try:
+                    WebDriverWait(driver, 4).until(
+                        EC.frame_to_be_available_and_switch_to_it(iframe)
+                    )
+                    click_play(driver, label=f"iframe#{idx+1}")
+                    force_play(driver, label=f"iframe#{idx+1}")
+                    driver.switch_to.default_content()
+                except Exception:
+                    driver.switch_to.default_content()
+
+                # Check after each iframe
+                time.sleep(1.5)
+                hits = [r for r in driver.requests if is_cdn_video(r)]
+                if hits:
+                    log("HIT", f"CDN URL found via iframe#{idx+1}")
+                    break
+            else:
+                log("WARN", "No CDN URL found in any iframe")
 
         driver.switch_to.default_content()
 
-        # Wait for CDN URL via WebDriverWait
-        log("INFO", "Waiting for CDN URL in network traffic (up to 30s)...")
-        try:
-            WebDriverWait(driver, 30, poll_frequency=0.5).until(CDNRequestFound())
-            log("HIT", "CDN URL detected!")
-        except Exception:
-            log("WARN", "WebDriverWait timed out — collecting whatever was captured")
-
-        # Extra settle for HLS segments
-        time.sleep(5)
-
-        # Collect all valid CDN URLs
+        # ── 6. Collect & rank all valid CDN URLs ──────────────────────────────
         found = []
         for req in driver.requests:
             if is_cdn_video(req) and req.url not in found:
                 found.append(req.url)
                 log("HIT", f"CDN URL: {req.url}")
 
-        # Prioritise m3u8 > mp4 > mkv > other
+        # m3u8 (HLS) > mp4 > mkv > other
         ordered = (
             [u for u in found if ".m3u8" in u.lower()] +
             [u for u in found if ".mp4"  in u.lower()] +
