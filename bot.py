@@ -390,7 +390,7 @@ async def dl_cmd(client: Client, message: Message):
             loop.run_in_executor(None, scrape_video_url, url), timeout=180
         )
     except asyncio.TimeoutError:
-        await status.edit_text("❌ Timed out after 3 minutes\.")
+        await status.edit_text("❌ Timed out after 3 minutes.")
         return
     except Exception as e:
         await status.edit_text(f"❌ Scraper crashed:\n`{esc(e)}`")
@@ -409,7 +409,7 @@ async def dl_cmd(client: Client, message: Message):
         return
 
     await status.edit_text(
-        f"✅ Found **{len(all_urls)}** CDN URL\(s\)\n"
+        f"✅ Found **{len(all_urls)}** CDN URL(s)\n"
         f"**Title:** {esc(title)}\n\n⬇️ Downloading..."
     )
 
@@ -424,7 +424,7 @@ async def dl_cmd(client: Client, message: Message):
             await status.edit_text(f"⚠️ URL #{i} failed, trying #{i+1}...")
 
     if not file_path or not os.path.exists(file_path):
-        await status.edit_text(f"❌ Download failed\.\n\nStream URL:\n`{esc(stream_url)}`")
+        await status.edit_text(f"❌ Download failed.\n\nStream URL:\n`{esc(stream_url)}`")
         return
 
     size_mb = os.path.getsize(file_path) / (1024 * 1024)
