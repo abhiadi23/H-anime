@@ -18,6 +18,11 @@ from seleniumwire import webdriver as wire_webdriver
 DOWNLOAD_DIR = "./downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
+
+def esc(text: str) -> str:
+    """Escape characters that break Pyrogram Markdown v2 entity parsing."""
+    return re.sub(r'([_*`\[\]()~>#+=|{}.!\\-])', r'\\\1', str(text))
+
 app = Client("hanime_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
 
@@ -385,14 +390,14 @@ async def dl_cmd(client: Client, message: Message):
             loop.run_in_executor(None, scrape_video_url, url), timeout=180
         )
     except asyncio.TimeoutError:
-        await status.edit_text("❌ Timed out after 3 minutes.")
+        await status.edit_text("❌ Timed out after 3 minutes\.")
         return
     except Exception as e:
-        await status.edit_text(f"❌ Scraper crashed:\n`{e}`")
+        await status.edit_text(f"❌ Scraper crashed:\n`{esc(e)}`")
         return
 
     if data.get("error"):
-        await status.edit_text(f"❌ Error:\n`{data['error']}`")
+        await status.edit_text(f"❌ Error:\n`{esc(data['error'])}`")
         return
 
     stream_url = data["stream_url"]
@@ -404,8 +409,8 @@ async def dl_cmd(client: Client, message: Message):
         return
 
     await status.edit_text(
-        f"✅ Found **{len(all_urls)}** CDN URL(s)\n"
-        f"**Title:** {title}\n\n⬇️ Downloading..."
+        f"✅ Found **{len(all_urls)}** CDN URL\(s\)\n"
+        f"**Title:** {esc(title)}\n\n⬇️ Downloading..."
     )
 
     session_id = str(uuid.uuid4())
@@ -419,14 +424,14 @@ async def dl_cmd(client: Client, message: Message):
             await status.edit_text(f"⚠️ URL #{i} failed, trying #{i+1}...")
 
     if not file_path or not os.path.exists(file_path):
-        await status.edit_text(f"❌ Download failed.\n\nStream URL:\n`{stream_url}`")
+        await status.edit_text(f"❌ Download failed\.\n\nStream URL:\n`{esc(stream_url)}`")
         return
 
     size_mb = os.path.getsize(file_path) / (1024 * 1024)
 
     if size_mb > 2000:
         await status.edit_text(
-            f"❌ File too large ({size_mb:.1f} MB). Telegram limit is 2000 MB.\n\n`{stream_url}`"
+            f"❌ File too large \({size_mb:.1f} MB\)\. Telegram limit is 2000 MB\.\n\n`{esc(stream_url)}`"
         )
         return
 
@@ -435,13 +440,13 @@ async def dl_cmd(client: Client, message: Message):
         await client.send_video(
             chat_id=message.chat.id,
             video=file_path,
-            caption=f"🎬 **{title}**\n📦 {size_mb:.1f} MB\n🔗 {url}",
+            caption=f"🎬 **{esc(title)}**\n📦 {size_mb:.1f} MB\n🔗 {esc(url)}",
             supports_streaming=True,
             reply_to_message_id=message.id,
         )
         await status.delete()
     except Exception as e:
-        await status.edit_text(f"❌ Upload failed:\n`{e}`")
+        await status.edit_text(f"❌ Upload failed:\n`{esc(e)}`")
     finally:
         try:
             import shutil
