@@ -3,3 +3,4 @@ TgCrypto
 selenium
 selenium-wire
 yt-dlp
+setuptools<82.0
