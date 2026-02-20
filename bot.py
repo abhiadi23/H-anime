@@ -13,7 +13,6 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.action_chains import ActionChains
 import undetected_chromedriver as uc
-from seleniumwire import webdriver as wire_webdriver
 
 DOWNLOAD_DIR = "./downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
@@ -80,51 +79,50 @@ def is_cdn_video(req) -> bool:
 # ─── DRIVER ───────────────────────────────────────────────────────────────────
 
 def build_driver():
-    sw_options = {
-        "disable_encoding": True,
-        "verify_ssl": False,
-    }
-
-    options = uc.ChromeOptions()
-    options.add_argument("--headless=new")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--window-size=1920,1080")
-    options.add_argument("--autoplay-policy=no-user-gesture-required")
-
-    # Use undetected_chromedriver patched into seleniumwire
-    driver = wire_webdriver.Chrome(
-        options=options,
-        seleniumwire_options=sw_options,
-        driver_executable_path=uc.Chrome(options=options, use_subprocess=True).service.path
-        if False else None,  # resolved below
-    )
-
-    return driver
-
-
-def build_driver():
     """
-    Combines undetected_chromedriver's stealth patching with
-    seleniumwire's request interception.
+    Builds a Chrome driver that combines:
+    - undetected_chromedriver stealth patching (removes automation fingerprints)
+    - seleniumwire traffic interception (captures CDN requests)
+    - proper flags for headless server environments (Heroku)
     """
-    sw_options = {
-        "disable_encoding": True,
-        "verify_ssl": False,
-    }
-
-    options = uc.ChromeOptions()
-    options.add_argument("--headless=new")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--window-size=1920,1080")
-    options.add_argument("--autoplay-policy=no-user-gesture-required")
-
-    # uc patches the chromedriver binary to remove automation fingerprints;
-    # we pass its binary path to seleniumwire so wire can intercept traffic.
     import seleniumwire.undetected_chromedriver as swuc
+
+    # Pick a random free port for the seleniumwire proxy to avoid collisions
+    # when multiple scrape jobs run concurrently
+    import socket
+    with socket.socket() as s:
+        s.bind(("", 0))
+        proxy_port = s.getsockname()[1]
+
+    sw_options = {
+        "disable_encoding": True,
+        "verify_ssl": False,
+        "addr": "127.0.0.1",
+        "port": proxy_port,
+    }
+
+    options = uc.ChromeOptions()
+    options.add_argument("--headless=new")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--window-size=1920,1080")
+    options.add_argument("--autoplay-policy=no-user-gesture-required")
+    # Fix SSL / "Privacy error" pages
+    options.add_argument("--ignore-certificate-errors")
+    options.add_argument("--ignore-ssl-errors")
+    options.add_argument("--allow-insecure-localhost")
+    # Needed so the seleniumwire MITM proxy cert is accepted
+    options.add_argument(f"--proxy-server=127.0.0.1:{proxy_port}")
+    # Stability on low-memory dynos
+    options.add_argument("--disable-extensions")
+    options.add_argument("--disable-background-networking")
+    options.add_argument("--disable-default-apps")
+    options.add_argument("--disable-sync")
+    options.add_argument("--metrics-recording-only")
+    options.add_argument("--mute-audio")
+    options.add_argument("--no-first-run")
+
     driver = swuc.Chrome(
         options=options,
         seleniumwire_options=sw_options,
