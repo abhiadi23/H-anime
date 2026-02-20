@@ -5,6 +5,6 @@ selenium-wire
 yt-dlp
 setuptools<82.0
 blinker==1.7.0
-ghost-cursor
+python-ghost-cursor
 bezier
 selenium-stealth
