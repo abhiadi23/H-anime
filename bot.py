@@ -6,7 +6,7 @@ import glob
 import uuid
 import random
 from config import *
-from pyrogram import Client, filters
+from pyrogram import Client, filters, enums
 from pyrogram.types import Message
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
@@ -19,9 +19,17 @@ DOWNLOAD_DIR = "./downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 
-def esc(text: str) -> str:
-    """Escape characters that break Pyrogram Markdown v2 entity parsing."""
-    return re.sub(r'([_*`\[\]()~>#+=|{}.!\\-])', r'\\\1', str(text))
+def html_esc(text: str) -> str:
+    """Escape characters that have special meaning in HTML."""
+    return (
+        str(text)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+
+PM = enums.ParseMode.HTML  # shorthand used on every send/edit call
 
 app = Client("hanime_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
@@ -364,9 +372,10 @@ async def download_with_ytdlp(
 @app.on_message(filters.command("start"))
 async def start_cmd(_, message: Message):
     await message.reply_text(
-        "👋 **Hanime Downloader Bot**\n\n"
-        "Usage: `/dl <hanime.tv URL>`\n\n"
-        "Stack: undetected-chromedriver · seleniumwire · yt-dlp"
+        "👋 <b>Hanime Downloader Bot</b>\n\n"
+        "Usage: <code>/dl &lt;hanime.tv URL&gt;</code>\n\n"
+        "Stack: undetected-chromedriver · seleniumwire · yt-dlp",
+        parse_mode=PM,
     )
 
 
@@ -374,15 +383,24 @@ async def start_cmd(_, message: Message):
 async def dl_cmd(client: Client, message: Message):
     args = message.text.split(maxsplit=1)
     if len(args) < 2:
-        await message.reply_text("❌ Usage: `/dl <hanime.tv URL>`")
+        await message.reply_text(
+            "❌ Usage: <code>/dl &lt;hanime.tv URL&gt;</code>",
+            parse_mode=PM,
+        )
         return
 
     url = args[1].strip()
     if "hanime.tv" not in url:
-        await message.reply_text("❌ Only hanime.tv URLs are supported.")
+        await message.reply_text(
+            "❌ Only hanime.tv URLs are supported.",
+            parse_mode=PM,
+        )
         return
 
-    status = await message.reply_text("🌐 Launching stealth Chrome... (~30–60s)")
+    status = await message.reply_text(
+        "🌐 Launching stealth Chrome... (~30–60s)",
+        parse_mode=PM,
+    )
 
     try:
         loop = asyncio.get_event_loop()
@@ -390,14 +408,18 @@ async def dl_cmd(client: Client, message: Message):
             loop.run_in_executor(None, scrape_video_url, url), timeout=180
         )
     except asyncio.TimeoutError:
-        await status.edit_text("❌ Timed out after 3 minutes.")
+        await status.edit_text("❌ Timed out after 3 minutes.", parse_mode=PM)
         return
     except Exception as e:
-        await status.edit_text(f"❌ Scraper crashed:\n`{esc(e)}`")
+        await status.edit_text(
+            f"❌ Scraper crashed:\n<code>{html_esc(e)}</code>", parse_mode=PM
+        )
         return
 
     if data.get("error"):
-        await status.edit_text(f"❌ Error:\n`{esc(data['error'])}`")
+        await status.edit_text(
+            f"❌ Error:\n<code>{html_esc(data['error'])}</code>", parse_mode=PM
+        )
         return
 
     stream_url = data["stream_url"]
@@ -405,12 +427,15 @@ async def dl_cmd(client: Client, message: Message):
     all_urls   = data["download_urls"]
 
     if not stream_url:
-        await status.edit_text("❌ No CDN video URL found. Login may be required.")
+        await status.edit_text(
+            "❌ No CDN video URL found. Login may be required.", parse_mode=PM
+        )
         return
 
     await status.edit_text(
-        f"✅ Found **{len(all_urls)}** CDN URL(s)\n"
-        f"**Title:** {esc(title)}\n\n⬇️ Downloading..."
+        f"✅ Found <b>{len(all_urls)}</b> CDN URL(s)\n"
+        f"<b>Title:</b> {html_esc(title)}\n\n⬇️ Downloading...",
+        parse_mode=PM,
     )
 
     session_id = str(uuid.uuid4())
@@ -421,32 +446,46 @@ async def dl_cmd(client: Client, message: Message):
         if file_path and os.path.exists(file_path):
             break
         if i < len(all_urls):
-            await status.edit_text(f"⚠️ URL #{i} failed, trying #{i+1}...")
+            await status.edit_text(
+                f"⚠️ URL #{i} failed, trying #{i + 1}...", parse_mode=PM
+            )
 
     if not file_path or not os.path.exists(file_path):
-        await status.edit_text(f"❌ Download failed.\n\nStream URL:\n`{esc(stream_url)}`")
+        await status.edit_text(
+            f"❌ Download failed.\n\nStream URL:\n<code>{html_esc(stream_url)}</code>",
+            parse_mode=PM,
+        )
         return
 
     size_mb = os.path.getsize(file_path) / (1024 * 1024)
 
     if size_mb > 2000:
         await status.edit_text(
-            f"❌ File too large ({size_mb:.1f} MB). Telegram limit is 2000 MB.\n\n`{esc(stream_url)}`"
+            f"❌ File too large ({size_mb:.1f} MB). Telegram limit is 2000 MB.\n\n"
+            f"<code>{html_esc(stream_url)}</code>",
+            parse_mode=PM,
         )
         return
 
-    await status.edit_text(f"📤 Uploading {size_mb:.1f} MB...")
+    await status.edit_text(f"📤 Uploading {size_mb:.1f} MB...", parse_mode=PM)
     try:
         await client.send_video(
             chat_id=message.chat.id,
             video=file_path,
-            caption=f"🎬 **{esc(title)}**\n📦 {size_mb:.1f} MB\n🔗 {esc(url)}",
+            caption=(
+                f"🎬 <b>{html_esc(title)}</b>\n"
+                f"📦 {size_mb:.1f} MB\n"
+                f"🔗 {html_esc(url)}"
+            ),
+            parse_mode=PM,
             supports_streaming=True,
             reply_to_message_id=message.id,
         )
         await status.delete()
     except Exception as e:
-        await status.edit_text(f"❌ Upload failed:\n`{esc(e)}`")
+        await status.edit_text(
+            f"❌ Upload failed:\n<code>{html_esc(e)}</code>", parse_mode=PM
+        )
     finally:
         try:
             import shutil
