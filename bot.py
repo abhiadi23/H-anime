@@ -431,7 +431,7 @@ async def dl_cmd(client: Client, message: Message):
 
     if size_mb > 2000:
         await status.edit_text(
-            f"❌ File too large \({size_mb:.1f} MB\)\. Telegram limit is 2000 MB\.\n\n`{esc(stream_url)}`"
+            f"❌ File too large ({size_mb:.1f} MB). Telegram limit is 2000 MB.\n\n`{esc(stream_url)}`"
         )
         return
 
