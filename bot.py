@@ -14,7 +14,7 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.chrome.options import Options
 from seleniumwire import webdriver as wire_webdriver
 from selenium_stealth import stealth
-from python_ghost_cursor import create_cursor # pip install python-ghost-cursor
+from python_ghost_cursor import createCursor # pip install python-ghost-cursor
 
 DOWNLOAD_DIR = "./downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
