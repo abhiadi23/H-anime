@@ -5,7 +5,6 @@ import time
 import glob
 import uuid
 import random
-import json
 from config import *
 from pyrogram import Client, filters, enums
 from pyrogram.types import Message
@@ -20,237 +19,58 @@ os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 
 def html_esc(text: str) -> str:
-    return (
-        str(text)
-        .replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-    )
+    return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 PM = enums.ParseMode.HTML
-
 app = Client("hanime_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-
-# ─── LOGGER ───────────────────────────────────────────────────────────────────
 
 def log(level: str, msg: str) -> None:
     print(f"[{time.strftime('%H:%M:%S')}] [{level.ljust(5)}] {msg}")
 
 
-# ─── URL FILTERS ──────────────────────────────────────────────────────────────
+# ─── URL VALIDATION ───────────────────────────────────────────────────────────
+
+# Known ad/fake video domains — always reject
+AD_BLACKLIST = re.compile(
+    r'(blankmp4s\.pages\.dev|'
+    r'adtng\.com|adnxs\.com|adsrvr\.org|advertising\.com|'
+    r'ads\.yahoo\.com|moatads\.com|amazon-adsystem\.com|'
+    r'exoclick\.com|trafficjunky\.net|traffichaus\.com|juicyads\.com|'
+    r'plugrush\.com|tsyndicate\.com|etahub\.com|realsrv\.com|'
+    r'doubleclick\.net|googletagmanager\.com|google-analytics\.com|'
+    r'creatives\.|ad-delivery\.)',
+    re.IGNORECASE
+)
+
+# Only accept URLs from known hanime/video CDN networks
+HANIME_CDN = re.compile(
+    r'(hwcdn\.net|hanime\.tv|videodelivery\.net|mux\.com|'
+    r'akamaized\.net|cloudfront\.net|fastly\.net|b-cdn\.net)',
+    re.IGNORECASE
+)
 
 VIDEO_EXT = re.compile(r'\.(m3u8|mp4|mkv|ts|m4v|webm)(\?|#|$)', re.IGNORECASE)
 
-CDN_DOMAINS = re.compile(
-    r'(cdn\d*\.hanime\.tv|hwcdn\.net|'
-    r'cloudfront\.net|akamaized\.net|fastly\.net|b-cdn\.net|'
-    r'videodelivery\.net|stream\.cloudflare\.com|stream\.mux\.com)',
-    re.IGNORECASE
-)
 
-HANIME_CDN = re.compile(
-    r'(hanime\.tv|hwcdn\.net|videodelivery\.net|mux\.com)',
-    re.IGNORECASE
-)
-
-BLACKLIST = re.compile(
-    r'(performance\.radar\.cloudflare\.com|cdnjs\.cloudflare\.com|'
-    r'cdn\.jsdelivr\.net|google-analytics\.com|googletagmanager\.com|'
-    r'doubleclick\.net|sentry\.io|newrelic\.com|analytics|tracking|'
-    r'telemetry|metrics|beacon|\.js(\?|$)|'
-    r'adtng\.com|adnxs\.com|adsrvr\.org|advertising\.com|'
-    r'ads\.yahoo\.com|moatads\.com|amazon-adsystem\.com|'
-    r'creatives\.|ad-delivery\.|adform\.net|rubiconproject\.com|'
-    r'openx\.net|pubmatic\.com|taboola\.com|outbrain\.com|'
-    r'exoclick\.com|trafficjunky\.net|traffichaus\.com|juicyads\.com|'
-    r'plugrush\.com|tsyndicate\.com|etahub\.com|realsrv\.com)',
-    re.IGNORECASE
-)
-
-
-def is_cdn_video_url(url: str, resource_type: str = "", status: int = 200) -> bool:
-    """Filter for valid CDN video URLs (works on URL strings, no request object needed)."""
-    if not url.startswith("http"):
+def is_real_video_url(url: str) -> bool:
+    if not url or not url.startswith("http"):
         return False
-    if BLACKLIST.search(url):
+    if AD_BLACKLIST.search(url):
         return False
-    has_video_ext = bool(VIDEO_EXT.search(url))
-    from_cdn      = bool(CDN_DOMAINS.search(url))
-    if not (has_video_ext or from_cdn):
+    # Must come from a known hanime CDN
+    if not HANIME_CDN.search(url):
         return False
-    if not HANIME_CDN.search(url) and not has_video_ext:
-        return False
-    if re.search(r'/(creatives|banners?|ads?|promo)/', url, re.IGNORECASE):
-        return False
-    if status not in (0, 200, 206):   # 0 = unknown (CDP sometimes omits it)
+    # Must have a video extension
+    if not VIDEO_EXT.search(url):
         return False
     return True
-
-
-# ─── CDP NETWORK INTERCEPTOR ──────────────────────────────────────────────────
-
-class CDPNetworkInterceptor:
-    """
-    Uses Chrome DevTools Protocol via Selenium's execute_cdp_cmd to intercept
-    all network requests/responses without seleniumwire.
-    Dramatically lower memory footprint.
-    """
-
-    def __init__(self, driver):
-        self.driver = driver
-        self.found_urls: list[str] = []
-        self._enabled = False
-
-    def enable(self):
-        """Enable CDP Network domain and attach JS listener via window.__cdp_urls."""
-        self.driver.execute_cdp_cmd("Network.enable", {})
-        # Inject a JS hook that collects XHR and fetch URLs into a global list
-        self.driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
-            "source": """
-                window.__cdp_urls = [];
-                (function() {
-                    // Intercept XHR
-                    const origOpen = XMLHttpRequest.prototype.open;
-                    XMLHttpRequest.prototype.open = function(method, url) {
-                        if (url) window.__cdp_urls.push(url);
-                        return origOpen.apply(this, arguments);
-                    };
-                    // Intercept fetch
-                    const origFetch = window.fetch;
-                    window.fetch = function(input, init) {
-                        try {
-                            const url = typeof input === 'string' ? input : input.url;
-                            if (url) window.__cdp_urls.push(url);
-                        } catch(e) {}
-                        return origFetch.apply(this, arguments);
-                    };
-                    // Intercept video src
-                    const origSrcDesc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'src');
-                    if (origSrcDesc) {
-                        Object.defineProperty(HTMLMediaElement.prototype, 'src', {
-                            set: function(val) {
-                                if (val) window.__cdp_urls.push(val);
-                                return origSrcDesc.set.call(this, val);
-                            },
-                            get: origSrcDesc.get
-                        });
-                    }
-                })();
-            """
-        })
-        self._enabled = True
-        log("INFO", "CDP network interceptor enabled")
-
-    def collect(self) -> list[str]:
-        """
-        Poll the JS-side URL list AND scan the CDP request log via
-        Performance.getMetrics + direct DOM inspection.
-        Returns deduplicated list of candidate CDN video URLs.
-        """
-        urls = set()
-
-        # 1. JS-injected XHR/fetch/src collector
-        try:
-            js_urls = self.driver.execute_script("return window.__cdp_urls || [];")
-            for u in js_urls:
-                if isinstance(u, str):
-                    urls.add(u)
-        except Exception as e:
-            log("WARN", f"JS collect failed: {e}")
-
-        # 2. Inspect all <video> and <source> tags on the page (incl. shadow DOM)
-        try:
-            media_urls = self.driver.execute_script("""
-                const urls = [];
-                document.querySelectorAll('video, video source').forEach(el => {
-                    if (el.src) urls.push(el.src);
-                    if (el.currentSrc) urls.push(el.currentSrc);
-                });
-                // Also check any blob/object URLs stored on video elements
-                document.querySelectorAll('video').forEach(v => {
-                    if (v.currentSrc) urls.push(v.currentSrc);
-                });
-                return urls;
-            """)
-            for u in (media_urls or []):
-                if isinstance(u, str):
-                    urls.add(u)
-        except Exception as e:
-            log("WARN", f"DOM media scan failed: {e}")
-
-        # 3. Use CDP Network.getAllCookies isn't useful, but we can read
-        #    performance entries which include resource URLs
-        try:
-            perf_entries = self.driver.execute_script("""
-                return performance.getEntriesByType('resource').map(e => e.name);
-            """)
-            for u in (perf_entries or []):
-                if isinstance(u, str):
-                    urls.add(u)
-        except Exception as e:
-            log("WARN", f"Performance entries failed: {e}")
-
-        # Filter
-        valid = [u for u in urls if is_cdn_video_url(u)]
-        for u in valid:
-            if u not in self.found_urls:
-                self.found_urls.append(u)
-                log("HIT", f"CDN URL intercepted: {u}")
-
-        return self.found_urls
-
-    def collect_in_iframe(self) -> list[str]:
-        """Same collection but runs inside the currently active iframe context."""
-        urls = set()
-        try:
-            js_urls = self.driver.execute_script("return window.__cdp_urls || [];")
-            for u in (js_urls or []):
-                if isinstance(u, str):
-                    urls.add(u)
-        except Exception:
-            pass
-        try:
-            media_urls = self.driver.execute_script("""
-                const urls = [];
-                document.querySelectorAll('video, video source').forEach(el => {
-                    if (el.src) urls.push(el.src);
-                    if (el.currentSrc) urls.push(el.currentSrc);
-                });
-                return urls;
-            """)
-            for u in (media_urls or []):
-                if isinstance(u, str):
-                    urls.add(u)
-        except Exception:
-            pass
-        try:
-            perf = self.driver.execute_script(
-                "return performance.getEntriesByType('resource').map(e => e.name);"
-            )
-            for u in (perf or []):
-                if isinstance(u, str):
-                    urls.add(u)
-        except Exception:
-            pass
-
-        valid = [u for u in urls if is_cdn_video_url(u)]
-        for u in valid:
-            if u not in self.found_urls:
-                self.found_urls.append(u)
-                log("HIT", f"CDN URL (iframe): {u}")
-
-        return self.found_urls
 
 
 # ─── DRIVER ───────────────────────────────────────────────────────────────────
 
 def build_driver():
-    """
-    Lightweight driver: plain undetected_chromedriver + CDP.
-    No seleniumwire proxy — saves ~200 MB RAM per session.
-    """
     options = uc.ChromeOptions()
     options.add_argument("--headless=new")
     options.add_argument("--no-sandbox")
@@ -260,57 +80,99 @@ def build_driver():
     options.add_argument("--autoplay-policy=no-user-gesture-required")
     options.add_argument("--ignore-certificate-errors")
     options.add_argument("--ignore-ssl-errors")
-    options.add_argument("--allow-insecure-localhost")
     options.add_argument("--disable-extensions")
     options.add_argument("--disable-background-networking")
     options.add_argument("--disable-default-apps")
     options.add_argument("--disable-sync")
-    options.add_argument("--metrics-recording-only")
     options.add_argument("--mute-audio")
     options.add_argument("--no-first-run")
-    # Extra memory savings
-    options.add_argument("--disable-images")          # skip image downloads
-    options.add_argument("--blink-settings=imagesEnabled=false")
     options.add_argument("--disable-software-rasterizer")
     options.add_argument("--js-flags=--max-old-space-size=256")
-
-    driver = uc.Chrome(options=options)
-    return driver
+    return uc.Chrome(options=options)
 
 
-# ─── HUMAN-LIKE MOUSE HELPERS ─────────────────────────────────────────────────
+# ─── JS TRACKER — injected before page loads ──────────────────────────────────
+# Tracks ONLY src assignments on HTMLMediaElement and XHR/fetch calls.
+# We read this after clicking play to get exactly what the player requested.
 
-def human_move_and_click(driver, element) -> None:
-    actions = ActionChains(driver)
-    offset_x = random.randint(-5, 5)
-    offset_y = random.randint(-3, 3)
-    actions.move_to_element_with_offset(element, offset_x, offset_y)
-    actions.pause(random.uniform(0.1, 0.3))
-    actions.click()
-    actions.perform()
+TRACKER_JS = """
+window.__vid_urls = [];
+
+// 1. Intercept video.src = "..." assignments
+(function() {
+    const desc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'src');
+    if (desc && desc.set) {
+        Object.defineProperty(HTMLMediaElement.prototype, 'src', {
+            set: function(val) {
+                if (val && typeof val === 'string' && val.startsWith('http')) {
+                    window.__vid_urls.push(val);
+                }
+                return desc.set.call(this, val);
+            },
+            get: desc.get,
+            configurable: true
+        });
+    }
+})();
+
+// 2. Intercept XHR for m3u8/mp4 requests
+(function() {
+    const orig = XMLHttpRequest.prototype.open;
+    XMLHttpRequest.prototype.open = function(method, url) {
+        if (url && typeof url === 'string' &&
+            /\.(m3u8|mp4|ts|m4v|mkv)(\?|#|$)/i.test(url)) {
+            window.__vid_urls.push(url);
+        }
+        return orig.apply(this, arguments);
+    };
+})();
+
+// 3. Intercept fetch for m3u8/mp4 requests
+(function() {
+    const orig = window.fetch;
+    window.fetch = function(input, init) {
+        try {
+            const url = typeof input === 'string' ? input : (input && input.url) || '';
+            if (url && /\.(m3u8|mp4|ts|m4v|mkv)(\?|#|$)/i.test(url)) {
+                window.__vid_urls.push(url);
+            }
+        } catch(e) {}
+        return orig.apply(this, arguments);
+    };
+})();
+"""
 
 
-# ─── PLAY SELECTORS ───────────────────────────────────────────────────────────
+# ─── PLAY BUTTON SELECTORS ────────────────────────────────────────────────────
+# Ordered from most specific (VideoJS, which hanime uses) to generic.
+# We do NOT include "video" as a play selector — clicking the video element
+# itself can trigger ad overlays instead of the main player.
 
 PLAY_SELECTORS = [
-    ".vjs-big-play-button",
-    ".plyr__control--overlaid",
-    "button.play-button",
-    "[class*='play-button']",
-    "[class*='PlayButton']",
-    ".ytp-large-play-button",
+    ".vjs-big-play-button",           # VideoJS — hanime's primary player
+    ".plyr__control--overlaid",       # Plyr player
+    "[class*='BigPlayButton']",
+    "[class*='big-play-button']",
+    "button[class*='play']",
+    "[aria-label='Play Video']",
     "[aria-label='Play']",
-    "video",
+    "[class*='play-button']:not(script):not(style)",
 ]
 
 
-def click_play(driver, label: str = "main") -> bool:
+def click_play_button(driver, label: str = "main") -> bool:
     for sel in PLAY_SELECTORS:
         try:
             el = WebDriverWait(driver, 4).until(
                 EC.element_to_be_clickable((By.CSS_SELECTOR, sel))
             )
-            human_move_and_click(driver, el)
+            if not el.is_displayed():
+                continue
+            ActionChains(driver)\
+                .move_to_element_with_offset(el, random.randint(-3, 3), random.randint(-2, 2))\
+                .pause(random.uniform(0.1, 0.25))\
+                .click()\
+                .perform()
             log("HIT", f"Play clicked [{label}] via {sel!r}")
             return True
         except Exception:
@@ -318,30 +180,113 @@ def click_play(driver, label: str = "main") -> bool:
     return False
 
 
-def force_play(driver, label: str = "main") -> None:
+def js_force_play(driver, label: str = "main") -> None:
     try:
         driver.execute_script(
             "document.querySelectorAll('video').forEach(v => {"
-            "  v.muted = false; v.volume = 1; v.play();"
+            "  v.muted = false; v.volume = 1; v.play().catch(()=>{});"
             "});"
         )
         log("INFO", f"JS force-play [{label}]")
     except Exception as e:
-        log("WARN", f"JS force-play failed [{label}]: {e}")
+        log("WARN", f"JS force-play failed: {e}")
 
 
-# ─── SCRAPER ──────────────────────────────────────────────────────────────────
+# ─── READ THE ACTUAL PLAYING VIDEO ───────────────────────────────────────────
+
+def read_playing_video(driver) -> str | None:
+    """
+    Check all <video> elements on the page.
+    Returns the currentSrc of a video that:
+      - is actually playing (not paused) OR has loaded data
+      - has a duration > 10s (rules out 2-second ad blanks)
+      - has a URL that passes our CDN + extension filter
+    """
+    try:
+        videos = driver.execute_script("""
+            var results = [];
+            document.querySelectorAll('video').forEach(function(v) {
+                results.push({
+                    currentSrc: v.currentSrc || '',
+                    src: v.src || '',
+                    paused: v.paused,
+                    readyState: v.readyState,
+                    duration: isNaN(v.duration) ? 0 : v.duration,
+                    networkState: v.networkState,
+                    ended: v.ended
+                });
+            });
+            return results;
+        """)
+    except Exception as e:
+        log("WARN", f"read_playing_video JS error: {e}")
+        return None
+
+    if not videos:
+        return None
+
+    for v in videos:
+        url = v.get("currentSrc") or v.get("src") or ""
+        dur = v.get("duration", 0)
+        log("INFO", f"  <video> paused={v.get('paused')} readyState={v.get('readyState')} "
+                    f"dur={dur:.1f}s src={url[:80]}")
+
+    # Pass 1: actively playing, real duration, real CDN URL
+    for v in videos:
+        url = v.get("currentSrc") or v.get("src") or ""
+        if (not v.get("paused") and
+                v.get("duration", 0) > 10 and
+                is_real_video_url(url)):
+            log("HIT", f"Playing video (dur={v['duration']:.1f}s): {url[:100]}")
+            return url
+
+    # Pass 2: loaded (readyState >= 2), real duration, real CDN URL
+    for v in videos:
+        url = v.get("currentSrc") or v.get("src") or ""
+        if (v.get("readyState", 0) >= 2 and
+                v.get("duration", 0) > 10 and
+                is_real_video_url(url)):
+            log("HIT", f"Loaded video (dur={v['duration']:.1f}s): {url[:100]}")
+            return url
+
+    # Pass 3: any CDN URL with positive duration (catches HLS where duration may be Infinity)
+    for v in videos:
+        url = v.get("currentSrc") or v.get("src") or ""
+        if v.get("duration", 0) > 0 and is_real_video_url(url):
+            log("HIT", f"Video with duration (dur={v['duration']:.1f}s): {url[:100]}")
+            return url
+
+    return None
+
+
+def read_tracker(driver) -> list[str]:
+    """Read URLs captured by our pre-injected JS tracker."""
+    try:
+        raw = driver.execute_script("return window.__vid_urls || [];")
+        urls = []
+        for u in (raw or []):
+            if isinstance(u, str) and is_real_video_url(u) and u not in urls:
+                urls.append(u)
+                log("HIT", f"Tracker: {u[:100]}")
+        return urls
+    except Exception as e:
+        log("WARN", f"read_tracker error: {e}")
+        return []
+
+
+# ─── MAIN SCRAPER ─────────────────────────────────────────────────────────────
 
 def scrape_video_url(page_url: str) -> dict:
     log("INFO", f"Scraping: {page_url}")
-
     result = {"title": "Unknown", "stream_url": None, "download_urls": [], "error": None}
     driver = build_driver()
-    interceptor = CDPNetworkInterceptor(driver)
 
     try:
-        # Enable CDP before loading page so injected JS runs from the start
-        interceptor.enable()
+        # Inject tracker BEFORE page loads so it catches everything from frame 0
+        driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+            "source": TRACKER_JS
+        })
+        log("INFO", "Tracker pre-injected via CDP")
 
         driver.get(page_url)
         WebDriverWait(driver, 30).until(
@@ -359,128 +304,81 @@ def scrape_video_url(page_url: str) -> dict:
             result["title"] = el.text.strip() or driver.title
         except Exception:
             result["title"] = driver.title
-
         result["title"] = re.sub(
             r'\s*[-|]\s*hanime\.tv.*$', '', result["title"], flags=re.IGNORECASE
         ).strip()
 
-        # ── Wait for player ────────────────────────────────────────────────────
-        for sel in ["video", ".video-js", ".plyr", "[class*='player']"]:
+        # ── Wait for play button ───────────────────────────────────────────────
+        log("INFO", "Waiting for play button...")
+        for sel in PLAY_SELECTORS:
             try:
-                WebDriverWait(driver, 8).until(
+                WebDriverWait(driver, 10).until(
                     EC.presence_of_element_located((By.CSS_SELECTOR, sel))
                 )
-                log("INFO", f"Player found: {sel!r}")
+                log("INFO", f"Play button ready: {sel!r}")
                 break
             except Exception:
                 continue
 
-        driver.execute_script("window.scrollBy(0, window.innerHeight * 0.4);")
-        time.sleep(0.4)
+        driver.execute_script("window.scrollBy(0, window.innerHeight * 0.3);")
+        time.sleep(0.3)
 
-        # ── Click play + collect ───────────────────────────────────────────────
-        click_play(driver, label="main")
-        force_play(driver, label="main")
+        # ── Click play ────────────────────────────────────────────────────────
+        clicked = click_play_button(driver, label="main")
+        if not clicked:
+            log("WARN", "No play button found — falling back to JS force-play")
+            js_force_play(driver, label="main")
 
-        # ── Fast poll — bail as soon as URL found (max 15s) ───────────────────
-        log("INFO", "Polling for CDN URL (up to 15s)...")
+        # ── Poll for the real video URL (max 15s) ─────────────────────────────
+        log("INFO", "Polling for real CDN video URL...")
+        stream_url = None
         deadline = time.time() + 15
-        found_early = False
+
         while time.time() < deadline:
-            if interceptor.collect():
-                elapsed = 15 - (deadline - time.time())
-                log("HIT", f"CDN URL found after {elapsed:.1f}s")
-                found_early = True
+            # Check 1: is the main <video> element actually playing something real?
+            url = read_playing_video(driver)
+            if url:
+                stream_url = url
                 break
-            time.sleep(0.3)
 
-        # ── Check iframes if nothing found ────────────────────────────────────
-        if not found_early:
-            log("INFO", "No CDN on main page — checking iframes...")
-            iframes = driver.find_elements(By.TAG_NAME, "iframe")
-            log("INFO", f"Found {len(iframes)} iframe(s)")
+            # Check 2: did our tracker catch an m3u8/mp4 request?
+            tracked = read_tracker(driver)
+            if tracked:
+                stream_url = tracked[0]
+                break
 
-            for idx, iframe in enumerate(iframes):
-                try:
-                    driver.switch_to.frame(iframe)
-                    log("INFO", f"Switched to iframe#{idx+1}")
+            time.sleep(0.4)
 
-                    # Re-inject collector into iframe context
-                    driver.execute_script("""
-                        if (!window.__cdp_urls) {
-                            window.__cdp_urls = [];
-                            const origOpen = XMLHttpRequest.prototype.open;
-                            XMLHttpRequest.prototype.open = function(method, url) {
-                                if (url) window.__cdp_urls.push(url);
-                                return origOpen.apply(this, arguments);
-                            };
-                            const origFetch = window.fetch;
-                            window.fetch = function(input, init) {
-                                try {
-                                    const url = typeof input === 'string' ? input : input.url;
-                                    if (url) window.__cdp_urls.push(url);
-                                } catch(e) {}
-                                return origFetch.apply(this, arguments);
-                            };
-                        }
-                    """)
+        # ── Final fallback: force-play and wait a bit more ────────────────────
+        if not stream_url:
+            log("INFO", "Retrying with JS force-play...")
+            js_force_play(driver, label="fallback")
+            time.sleep(4)
+            stream_url = read_playing_video(driver)
+            if not stream_url:
+                tracked = read_tracker(driver)
+                stream_url = tracked[0] if tracked else None
 
-                    click_play(driver, label=f"iframe#{idx+1}")
-                    force_play(driver, label=f"iframe#{idx+1}")
+        # ── Collect all valid URLs found ───────────────────────────────────────
+        all_urls = []
+        if stream_url:
+            all_urls.append(stream_url)
+        for u in read_tracker(driver):
+            if u not in all_urls:
+                all_urls.append(u)
 
-                    # Collect from iframe
-                    time.sleep(1.0)
-                    interceptor.collect_in_iframe()
-
-                    driver.switch_to.default_content()
-                except Exception as e:
-                    log("WARN", f"iframe#{idx+1} error: {e}")
-                    driver.switch_to.default_content()
-
-                if interceptor.found_urls:
-                    log("HIT", f"CDN URL found via iframe#{idx+1}")
-                    break
-            else:
-                if not interceptor.found_urls:
-                    log("WARN", "No CDN URL found in any iframe")
-
-        driver.switch_to.default_content()
-
-        # ── Final collect pass on main page ───────────────────────────────────
-        interceptor.collect()
-
-        # ── Also do a direct DOM scan for video src (catches lazy-set sources) ─
-        try:
-            all_video_urls = driver.execute_script("""
-                const urls = [];
-                document.querySelectorAll('video').forEach(v => {
-                    if (v.src && v.src.startsWith('http')) urls.push(v.src);
-                    if (v.currentSrc && v.currentSrc.startsWith('http')) urls.push(v.currentSrc);
-                    v.querySelectorAll('source').forEach(s => {
-                        if (s.src) urls.push(s.src);
-                    });
-                });
-                return urls;
-            """)
-            for u in (all_video_urls or []):
-                if is_cdn_video_url(u) and u not in interceptor.found_urls:
-                    interceptor.found_urls.append(u)
-                    log("HIT", f"DOM video src: {u}")
-        except Exception as e:
-            log("WARN", f"DOM video scan failed: {e}")
-
-        # ── Rank & return ──────────────────────────────────────────────────────
-        found = interceptor.found_urls
+        # Rank: m3u8 (HLS) > mp4 > other
         ordered = (
-            [u for u in found if ".m3u8" in u.lower()] +
-            [u for u in found if ".mp4"  in u.lower()] +
-            [u for u in found if ".mkv"  in u.lower()] +
-            [u for u in found if not any(x in u.lower() for x in (".m3u8", ".mp4", ".mkv"))]
+            [u for u in all_urls if ".m3u8" in u.lower()] +
+            [u for u in all_urls if ".mp4"  in u.lower()] +
+            [u for u in all_urls if not any(x in u.lower() for x in (".m3u8", ".mp4"))]
         )
 
         result["stream_url"]    = ordered[0] if ordered else None
         result["download_urls"] = ordered
-        log("INFO", f"Done — {len(ordered)} CDN URL(s) | Title: {result['title']!r}")
+        log("INFO", f"Done — {len(ordered)} URL(s) | Title: {result['title']!r}")
+        for u in ordered:
+            log("INFO", f"  > {u[:120]}")
 
     except Exception as e:
         result["error"] = str(e)
@@ -551,8 +449,7 @@ async def download_with_ytdlp(
 async def start_cmd(_, message: Message):
     await message.reply_text(
         "👋 <b>Hanime Downloader Bot</b>\n\n"
-        "Usage: <code>/dl &lt;hanime.tv URL&gt;</code>\n\n"
-        "Stack: undetected-chromedriver · CDP network interception · yt-dlp",
+        "Usage: <code>/dl &lt;hanime.tv URL&gt;</code>",
         parse_mode=PM,
     )
 
@@ -561,24 +458,15 @@ async def start_cmd(_, message: Message):
 async def dl_cmd(client: Client, message: Message):
     args = message.text.split(maxsplit=1)
     if len(args) < 2:
-        await message.reply_text(
-            "❌ Usage: <code>/dl &lt;hanime.tv URL&gt;</code>",
-            parse_mode=PM,
-        )
+        await message.reply_text("❌ Usage: <code>/dl &lt;hanime.tv URL&gt;</code>", parse_mode=PM)
         return
 
     url = args[1].strip()
     if "hanime.tv" not in url:
-        await message.reply_text(
-            "❌ Only hanime.tv URLs are supported.",
-            parse_mode=PM,
-        )
+        await message.reply_text("❌ Only hanime.tv URLs are supported.", parse_mode=PM)
         return
 
-    status = await message.reply_text(
-        "🌐 Launching stealth Chrome... (~20–40s)",
-        parse_mode=PM,
-    )
+    status = await message.reply_text("🌐 Launching Chrome... (~20–35s)", parse_mode=PM)
 
     try:
         loop = asyncio.get_event_loop()
@@ -589,15 +477,11 @@ async def dl_cmd(client: Client, message: Message):
         await status.edit_text("❌ Timed out after 3 minutes.", parse_mode=PM)
         return
     except Exception as e:
-        await status.edit_text(
-            f"❌ Scraper crashed:\n<code>{html_esc(e)}</code>", parse_mode=PM
-        )
+        await status.edit_text(f"❌ Scraper crashed:\n<code>{html_esc(e)}</code>", parse_mode=PM)
         return
 
     if data.get("error"):
-        await status.edit_text(
-            f"❌ Error:\n<code>{html_esc(data['error'])}</code>", parse_mode=PM
-        )
+        await status.edit_text(f"❌ Error:\n<code>{html_esc(data['error'])}</code>", parse_mode=PM)
         return
 
     stream_url = data["stream_url"]
@@ -605,13 +489,11 @@ async def dl_cmd(client: Client, message: Message):
     all_urls   = data["download_urls"]
 
     if not stream_url:
-        await status.edit_text(
-            "❌ No CDN video URL found. Login may be required.", parse_mode=PM
-        )
+        await status.edit_text("❌ No video URL found. Login may be required.", parse_mode=PM)
         return
 
     await status.edit_text(
-        f"✅ Found <b>{len(all_urls)}</b> CDN URL(s)\n"
+        f"✅ Found <b>{len(all_urls)}</b> URL(s)\n"
         f"<b>Title:</b> {html_esc(title)}\n\n⬇️ Downloading...",
         parse_mode=PM,
     )
@@ -624,9 +506,7 @@ async def dl_cmd(client: Client, message: Message):
         if file_path and os.path.exists(file_path):
             break
         if i < len(all_urls):
-            await status.edit_text(
-                f"⚠️ URL #{i} failed, trying #{i + 1}...", parse_mode=PM
-            )
+            await status.edit_text(f"⚠️ URL #{i} failed, trying #{i+1}...", parse_mode=PM)
 
     if not file_path or not os.path.exists(file_path):
         await status.edit_text(
@@ -639,8 +519,7 @@ async def dl_cmd(client: Client, message: Message):
 
     if size_mb > 2000:
         await status.edit_text(
-            f"❌ File too large ({size_mb:.1f} MB). Telegram limit is 2000 MB.\n\n"
-            f"<code>{html_esc(stream_url)}</code>",
+            f"❌ File too large ({size_mb:.1f} MB).\n<code>{html_esc(stream_url)}</code>",
             parse_mode=PM,
         )
         return
@@ -661,9 +540,7 @@ async def dl_cmd(client: Client, message: Message):
         )
         await status.delete()
     except Exception as e:
-        await status.edit_text(
-            f"❌ Upload failed:\n<code>{html_esc(e)}</code>", parse_mode=PM
-        )
+        await status.edit_text(f"❌ Upload failed:\n<code>{html_esc(e)}</code>", parse_mode=PM)
     finally:
         try:
             import shutil
@@ -671,8 +548,6 @@ async def dl_cmd(client: Client, message: Message):
         except Exception:
             pass
 
-
-# ─── MAIN ─────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     app.run()
