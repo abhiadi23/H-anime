@@ -4,3 +4,4 @@ selenium
 selenium-wire
 yt-dlp
 setuptools<82.0
+blinker==1.7.0
