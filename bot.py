@@ -3,6 +3,7 @@ import re
 import os
 import time
 import glob
+import uuid
 from config import *
 from pyrogram import Client, filters
 from pyrogram.types import Message
@@ -13,7 +14,6 @@ from selenium.webdriver.chrome.options import Options
 from seleniumwire import webdriver as wire_webdriver
 
 DOWNLOAD_DIR = "./downloads"
-
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 app = Client("hanime_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
@@ -23,13 +23,11 @@ app = Client("hanime_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN
 # STRICT URL FILTER — only CDN/video URLs
 # ─────────────────────────────────────────────
 
-# Must have one of these extensions
 VIDEO_EXTENSIONS = re.compile(
     r'\.(m3u8|mp4|mkv|ts|m4v|webm)(\?|#|$)',
     re.IGNORECASE
 )
 
-# Must come from one of these CDN domains
 CDN_DOMAINS = re.compile(
     r'('
     r'cdn\d*\.hanime\.tv|'
@@ -47,11 +45,6 @@ CDN_DOMAINS = re.compile(
 
 
 def is_valid_video_url(url: str) -> bool:
-    """
-    Returns True only if the URL has a video file extension
-    OR comes from a known CDN domain.
-    Filters out all analytics, JS, images, API calls, etc.
-    """
     if not url or not url.startswith("http"):
         return False
     has_video_ext  = bool(VIDEO_EXTENSIONS.search(url))
@@ -87,6 +80,20 @@ def scrape_video_url(page_url: str) -> dict:
     Opens the page in selenium-wire headless Chrome,
     clicks play, then intercepts all network requests
     and scans page source + iframes for CDN/video URLs.
+
+    Flow:
+      1. Load page
+      2. Grab title
+      3. Click play button (main page)
+      4. Force play via JS (main page)
+      5. Repeat click + force play inside every iframe
+      6. Wait for network traffic to fire
+      7. Harvest URLs from intercepted network requests  ← primary method
+      8. Scan main page source (HTML attrs + JSON blobs) ← fallback
+      9. Scan each iframe source                         ← fallback
+     10. Safety reset to default_content
+     11. Scan anchor <a> download tags                  ← fallback
+     12. Prioritize: m3u8 > mp4 > mkv > bare CDN
     """
     driver = wire_webdriver.Chrome(
         options=get_chrome_options(),
@@ -100,6 +107,15 @@ def scrape_video_url(page_url: str) -> dict:
         "thumbnail":     None,
         "error":         None,
     }
+
+    play_selectors = [
+        ".vjs-big-play-button",
+        ".plyr__control--overlaid",
+        "button.play-button",
+        "[class*='play-button']",
+        "[class*='PlayButton']",
+        "video",
+    ]
 
     try:
         driver.get(page_url)
@@ -117,15 +133,6 @@ def scrape_video_url(page_url: str) -> dict:
             result["title"] = driver.title
 
         # ── Step 2: Click play button on main page ──
-        play_selectors = [
-            ".vjs-big-play-button",
-            ".plyr__control--overlaid",
-            "button.play-button",
-
-"[class*='play-button']",
-            "[class*='PlayButton']",
-            "video",
-        ]
         for sel in play_selectors:
             try:
                 btn = WebDriverWait(driver, 5).until(
@@ -137,7 +144,7 @@ def scrape_video_url(page_url: str) -> dict:
             except Exception:
                 continue
 
-        # ── Step 3: Force play via JS ──
+        # ── Step 3: Force play via JS on main page ──
         try:
             driver.execute_script(
                 "document.querySelectorAll('video')"
@@ -146,14 +153,13 @@ def scrape_video_url(page_url: str) -> dict:
         except Exception:
             pass
 
-        # ── Step 4: Click play inside every iframe ──
+        # ── Step 4: Click play + force play inside every iframe ──
         try:
             iframes = driver.find_elements(By.TAG_NAME, "iframe")
             for iframe in iframes:
                 try:
                     driver.switch_to.frame(iframe)
 
-                    # Try clicking play inside iframe
                     for sel in play_selectors:
                         try:
                             btn = WebDriverWait(driver, 3).until(
@@ -165,7 +171,6 @@ def scrape_video_url(page_url: str) -> dict:
                         except Exception:
                             continue
 
-                    # Force play inside iframe too
                     try:
                         driver.execute_script(
                             "document.querySelectorAll('video')"
@@ -183,13 +188,15 @@ def scrape_video_url(page_url: str) -> dict:
             pass
 
         # ── Step 5: Wait for all network traffic to fire ──
-        time.sleep(7)
+        # 12s gives slow CDN auth + HLS manifest requests time to complete
+        time.sleep(12)
 
         found_urls = []
 
-        # ── Step 6: Scan intercepted network requests ──
-        # selenium-wire logs every HTTP/HTTPS request Chrome made
-        # including background XHR/fetch calls from the video player JS
+        # ── Step 6: Scan intercepted network requests (PRIMARY METHOD) ──
+        # selenium-wire logs every HTTP/HTTPS request Chrome made,
+        # including XHR/fetch calls from the video player JS.
+        # This catches the CDN URL even when it's never written in HTML.
         for req in driver.requests:
             url = req.url
             if not is_valid_video_url(url):
@@ -202,7 +209,7 @@ def scrape_video_url(page_url: str) -> dict:
             found_urls.append(url)
             print(f"[+] Network request: {url}")
 
-        # ── Step 7: Scan main page source ──
+        # ── Step 7: Scan main page source (FALLBACK) ──
         try:
             src = driver.page_source
 
@@ -226,7 +233,7 @@ def scrape_video_url(page_url: str) -> dict:
         except Exception:
             pass
 
-        # ── Step 8: Scan every iframe's source ──
+        # ── Step 8: Scan every iframe's source (FALLBACK) ──
         try:
             iframes = driver.find_elements(By.TAG_NAME, "iframe")
             for iframe in iframes:
@@ -234,7 +241,6 @@ def scrape_video_url(page_url: str) -> dict:
                     driver.switch_to.frame(iframe)
                     iframe_src = driver.page_source
 
-# HTML attributes inside iframe
                     for m in re.findall(
                         r'(?:src|file|url|source)=["\']([^"\']+)["\']',
                         iframe_src
@@ -243,7 +249,6 @@ def scrape_video_url(page_url: str) -> dict:
                             found_urls.append(m)
                             print(f"[+] iframe source attr: {m}")
 
-                    # JSON blobs inside iframe
                     for m in re.findall(
                         r'"(?:src|url|file|source|stream|hls|video)"\s*:\s*"(https?://[^"]+)"',
                         iframe_src
@@ -260,7 +265,14 @@ def scrape_video_url(page_url: str) -> dict:
         except Exception:
             pass
 
-        # ── Step 9: Scan anchor download tags ──
+        # ── Step 9: Safety reset before anchor scan ──
+        # Ensures we're never stuck inside an iframe when scanning <a> tags
+        try:
+            driver.switch_to.default_content()
+        except Exception:
+            pass
+
+        # ── Step 10: Scan anchor download tags (FALLBACK) ──
         try:
             for link in driver.find_elements(By.CSS_SELECTOR, "a[href], a[download]"):
                 href = link.get_attribute("href") or ""
@@ -270,8 +282,8 @@ def scrape_video_url(page_url: str) -> dict:
         except Exception:
             pass
 
-        # ── Step 10: Prioritize URLs ──
-        # m3u8 first (HLS manifest, yt-dlp picks best quality from it)
+        # ── Step 11: Prioritize URLs ──
+        # m3u8 first — HLS manifest, yt-dlp picks best quality automatically
         # then mp4, mkv, then bare CDN URLs
         m3u8_urls = [u for u in found_urls if ".m3u8" in u.lower()]
         mp4_urls  = [u for u in found_urls if ".mp4"  in u.lower()]
@@ -286,7 +298,7 @@ def scrape_video_url(page_url: str) -> dict:
         result["stream_url"]    = ordered[0] if ordered else None
         result["download_urls"] = ordered
 
-        # ── Step 11: Thumbnail ──
+        # ── Step 12: Thumbnail ──
         try:
             og = driver.find_element(By.CSS_SELECTOR, 'meta[property="og:image"]')
             result["thumbnail"] = og.get_attribute("content")
@@ -308,15 +320,21 @@ def scrape_video_url(page_url: str) -> dict:
 async def download_with_ytdlp(
     cdn_url: str,
     title: str,
+    session_id: str,
     status_msg: Message,
 ) -> str | None:
     """
     Runs yt-dlp as a subprocess to download from CDN/stream URL.
-    Streams stdout so we can update Telegram with live progress.
+    Uses a unique session_id per request to avoid filename collisions
+    when multiple users download simultaneously.
     Returns the path to the downloaded file or None on failure.
     """
     safe_title = re.sub(r'[^\w\s-]', '', title)[:60].strip() or "video"
-    output_template = os.path.join(DOWNLOAD_DIR, f"{safe_title}.%(ext)s")
+    # Unique subfolder per download session — prevents glob collisions
+    session_dir = os.path.join(DOWNLOAD_DIR, session_id)
+    os.makedirs(session_dir, exist_ok=True)
+
+    output_template = os.path.join(session_dir, f"{safe_title}.%(ext)s")
 
     cmd = [
         "yt-dlp",
@@ -354,12 +372,9 @@ async def download_with_ytdlp(
         last_line = line
         print(f"[yt-dlp] {line}")
 
-# Update Telegram message every 5 seconds with progress
         if "[download]" in line and time.time() - last_update > 5:
             try:
-                await status_msg.edit_text(
-                    f"⬇️ Downloading...\n\n{line}"
-                )
+                await status_msg.edit_text(f"⬇️ Downloading...\n\n{line}")
                 last_update = time.time()
             except Exception:
                 pass
@@ -370,8 +385,8 @@ async def download_with_ytdlp(
         print(f"[!] yt-dlp failed — last line: {last_line}")
         return None
 
-    # Find the output file (extension may vary)
-    pattern = os.path.join(DOWNLOAD_DIR, f"{safe_title}.*")
+    # Find output file inside the unique session folder
+    pattern = os.path.join(session_dir, f"{safe_title}.*")
     files   = sorted(glob.glob(pattern), key=os.path.getmtime, reverse=True)
     return files[0] if files else None
 
@@ -383,30 +398,33 @@ async def download_with_ytdlp(
 @app.on_message(filters.command("start"))
 async def start_cmd(_, message: Message):
     await message.reply_text(
-        "👋 Hanime Downloader Bot\n\n"
-        "Usage:\n"
-        "/dl <hanime.tv video URL>\n\n"
-        "Example:\n"
-        "/dl https://hanime.tv/videos/hentai/some-title\n\n"
-        "What happens:\n"
+        "👋 **Hanime Downloader Bot**\n\n"
+        "**Usage:**\n"
+        "`/dl <hanime.tv video URL>`\n"
+        "`/direct <hanime.tv video URL>`\n\n"
+        "**Example:**\n"
+        "`/dl https://hanime.tv/videos/hentai/some-title`\n\n"
+        "**What happens:**\n"
         "1. Opens page in headless Chrome\n"
         "2. Clicks play to trigger CDN requests\n"
-        "3. Intercepts network traffic via selenium-wire\n"
-        "4. Scans page source + iframes for video URLs\n"
-        "5. Filters strictly for .m3u8 / .mp4 / .mkv / CDN domains\n"
-        "6. Downloads best quality via yt-dlp\n"
-        "7. Uploads to Telegram"
+        "3. Force-plays via JS on page + inside iframes\n"
+        "4. Intercepts all network traffic via selenium-wire\n"
+        "5. Scans page source + iframes for video URLs\n"
+        "6. Filters strictly for .m3u8 / .mp4 / .mkv / CDN domains\n"
+        "7. Downloads best quality via yt-dlp\n"
+        "8. Uploads to Telegram"
     )
 
 
-@app.on_message(filters.command("dl"))
+# FIX: support both /dl and /direct as commands
+@app.on_message(filters.command(["dl", "direct"]))
 async def dl_cmd(client: Client, message: Message):
     args = message.text.split(maxsplit=1)
 
     if len(args) < 2:
         await message.reply_text(
             "❌ Please provide a URL.\n\n"
-            "Usage: /dl <hanime.tv URL>"
+            "Usage: `/dl <hanime.tv URL>`"
         )
         return
 
@@ -418,13 +436,19 @@ async def dl_cmd(client: Client, message: Message):
 
     status = await message.reply_text(
         "🌐 Opening page in headless Chrome...\n"
-        "This may take 15–30 seconds."
+        "This may take 20–40 seconds."
     )
 
-    # ── Phase 1: Scrape ──
+    # ── Phase 1: Scrape with timeout ──
     try:
         loop = asyncio.get_event_loop()
-        data = await loop.run_in_executor(None, scrape_video_url, url)
+        data = await asyncio.wait_for(
+            loop.run_in_executor(None, scrape_video_url, url),
+            timeout=120  # 2 minute hard limit on scraper
+        )
+    except asyncio.TimeoutError:
+        await status.edit_text("❌ Scraper timed out after 2 minutes.")
+        return
     except Exception as e:
         await status.edit_text(f"❌ Scraper crashed:\n{e}")
         return
@@ -444,60 +468,92 @@ async def dl_cmd(client: Client, message: Message):
         )
         return
 
-    # Show what we found
-    url_type = "m3u8 (HLS)" if ".m3u8" in stream_url else \
-               "mp4" if ".mp4" in stream_url else \
-               "mkv" if ".mkv" in stream_url else "CDN stream"
+    url_type = (
+        "m3u8 (HLS)" if ".m3u8" in stream_url else
+        "mp4"        if ".mp4"  in stream_url else
+        "mkv"        if ".mkv"  in stream_url else
+        "CDN stream"
+    )
 
     found_text = "\n".join(
-        f"{i+1}. {u[:80]}{'...' if len(u) > 80 else ''}"
+        f"{i+1}. `{u[:80]}{'...' if len(u) > 80 else ''}`"
         for i, u in enumerate(all_urls[:5])
     )
 
     await status.edit_text(
-        f"✅ Found {len(all_urls)} video URL(s)\n\n"
-        f"Title: {title}\n"
-        f"Type: {url_type}\n\n"
-        f"All found:\n{found_text}\n\n"
+        f"✅ Found **{len(all_urls)}** video URL(s)\n\n"
+        f"**Title:** {title}\n"
+        f"**Type:** {url_type}\n\n"
+        f"**All found:**\n{found_text}\n\n"
         f"⬇️ Starting download..."
     )
 
-    # ── Phase 2: Download ──
-    file_path = await download_with_ytdlp(stream_url, title, status)
+    # Unique session ID per request — prevents concurrent download collisions
+    session_id = str(uuid.uuid4())
+    file_path  = None
 
+    # ── Phase 2: Try stream_url first ──
+    file_path = await download_with_ytdlp(stream_url, title, session_id, status)
+
+    # ── Phase 3: Try remaining CDN URLs before falling back to page URL ──
     if not file_path or not os.path.exists(file_path):
-        # Retry with original page URL directly
+        for i, fallback_url in enumerate(all_urls[1:], start=2):
+            await status.edit_text(
+                f"⚠️ URL #{i-1} failed, trying URL #{i} of {len(all_urls)}..."
+            )
+            file_path = await download_with_ytdlp(fallback_url, title, session_id, status)
+            if file_path and os.path.exists(file_path):
+                break
+
+    # ── Phase 4: Last resort — use original page URL directly ──
+    if not file_path or not os.path.exists(file_path):
         await status.edit_text(
-            "⚠️ CDN URL failed, retrying with page URL via yt-dlp..."
+            "⚠️ All CDN URLs failed, retrying with original page URL via yt-dlp..."
         )
-        file_path = await download_with_ytdlp(url, title, status)
+        file_path = await download_with_ytdlp(url, title, session_id, status)
 
     if not file_path or not os.path.exists(file_path):
         await status.edit_text(
             f"❌ Download failed.\n\n"
-            f"Stream URL (copy manually):\n{stream_url}"
+            f"**Stream URL (copy manually):**\n`{stream_url}`"
         )
         return
 
     file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
 
-# ── Phase 3: Upload ──
+    # ── Phase 5: Check Telegram's 2 GB upload limit ──
+    if file_size_mb > 2000:
+        await status.edit_text(
+            f"❌ File too large: **{file_size_mb:.1f} MB**\n"
+            f"Telegram's limit is 2000 MB.\n\n"
+            f"**Stream URL (use externally):**\n`{stream_url}`"
+        )
+        try:
+            import shutil
+            shutil.rmtree(os.path.dirname(file_path), ignore_errors=True)
+        except Exception:
+            pass
+        return
+
+    # ── Phase 6: Upload ──
     await status.edit_text(
-        f"📤 Uploading {file_size_mb:.1f} MB to Telegram..."
+        f"📤 Uploading **{file_size_mb:.1f} MB** to Telegram..."
     )
 
+    upload_ok = False
     try:
         await client.send_video(
             chat_id=message.chat.id,
             video=file_path,
             caption=(
-                f"🎬 {title}\n\n"
+                f"🎬 **{title}**\n\n"
                 f"📦 Size: {file_size_mb:.1f} MB\n"
                 f"🔗 Source: {url}"
             ),
             supports_streaming=True,
             reply_to_message_id=message.id,
         )
+        upload_ok = True
         await status.delete()
 
     except Exception as e:
@@ -507,16 +563,20 @@ async def dl_cmd(client: Client, message: Message):
         )
 
     finally:
-        try:
-            os.remove(file_path)
-        except Exception:
-            pass
+        # Only clean up file on successful upload
+        # On failure, keep it so user knows the download worked
+        if upload_ok:
+            try:
+                import shutil
+                shutil.rmtree(os.path.dirname(file_path), ignore_errors=True)
+            except Exception:
+                pass
 
 
 # ─────────────────────────────────────────────
-# MAIN
+# MAIN  ← FIX: was `if name == "main"` (missing underscores — bot never started)
 # ─────────────────────────────────────────────
 
-if name == "main":
+if __name__ == "__main__":
     print("[*] Bot starting...")
     app.run()
