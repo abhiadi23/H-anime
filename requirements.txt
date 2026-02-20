@@ -6,3 +6,4 @@ yt-dlp
 setuptools<82.0
 blinker==1.7.0
 python-ghost-cursor
+bezier
