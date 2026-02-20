@@ -11,10 +11,9 @@ from pyrogram.types import Message
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.action_chains import ActionChains
+import undetected_chromedriver as uc
 from seleniumwire import webdriver as wire_webdriver
-from selenium_stealth import stealth
-from python_ghost_cursor import createCursor # pip install python-ghost-cursor
 
 DOWNLOAD_DIR = "./downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
@@ -68,37 +67,82 @@ def is_cdn_video(req) -> bool:
 # ─── DRIVER ───────────────────────────────────────────────────────────────────
 
 def build_driver():
-    options = Options()
+    sw_options = {
+        "disable_encoding": True,
+        "verify_ssl": False,
+    }
+
+    options = uc.ChromeOptions()
     options.add_argument("--headless=new")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
     options.add_argument("--window-size=1920,1080")
     options.add_argument("--autoplay-policy=no-user-gesture-required")
-    options.add_argument("--disable-blink-features=AutomationControlled")
-    options.add_experimental_option("excludeSwitches", ["enable-automation"])
-    options.add_experimental_option("useAutomationExtension", False)
-    options.add_argument(
-        "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-    )
 
+    # Use undetected_chromedriver patched into seleniumwire
     driver = wire_webdriver.Chrome(
         options=options,
-        seleniumwire_options={"disable_encoding": True, "verify_ssl": False},
-    )
-
-    stealth(
-        driver,
-        languages=["en-US", "en"],
-        vendor="Google Inc.",
-        platform="Win32",
-        webgl_vendor="Intel Inc.",
-        renderer="Intel Iris OpenGL Engine",
-        fix_hairline=True,
+        seleniumwire_options=sw_options,
+        driver_executable_path=uc.Chrome(options=options, use_subprocess=True).service.path
+        if False else None,  # resolved below
     )
 
     return driver
+
+
+def build_driver():
+    """
+    Combines undetected_chromedriver's stealth patching with
+    seleniumwire's request interception.
+    """
+    sw_options = {
+        "disable_encoding": True,
+        "verify_ssl": False,
+    }
+
+    options = uc.ChromeOptions()
+    options.add_argument("--headless=new")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--window-size=1920,1080")
+    options.add_argument("--autoplay-policy=no-user-gesture-required")
+
+    # uc patches the chromedriver binary to remove automation fingerprints;
+    # we pass its binary path to seleniumwire so wire can intercept traffic.
+    import seleniumwire.undetected_chromedriver as swuc
+    driver = swuc.Chrome(
+        options=options,
+        seleniumwire_options=sw_options,
+    )
+
+    return driver
+
+
+# ─── HUMAN-LIKE MOUSE HELPERS ─────────────────────────────────────────────────
+
+def human_move_and_click(driver, element) -> None:
+    """Move to element with slight randomised offset then click."""
+    actions = ActionChains(driver)
+    # Move to element with a small random offset to mimic human imprecision
+    offset_x = random.randint(-5, 5)
+    offset_y = random.randint(-3, 3)
+    actions.move_to_element_with_offset(element, offset_x, offset_y)
+    actions.pause(random.uniform(0.1, 0.4))
+    actions.click()
+    actions.perform()
+
+
+def human_move_random(driver) -> None:
+    """Move the mouse to a random point on the viewport."""
+    vw = driver.execute_script("return window.innerWidth;")
+    vh = driver.execute_script("return window.innerHeight;")
+    x = random.randint(100, max(101, vw - 100))
+    y = random.randint(100, max(101, vh - 100))
+    actions = ActionChains(driver)
+    actions.move_by_offset(x, y)
+    actions.perform()
 
 
 # ─── PLAY SELECTORS ───────────────────────────────────────────────────────────
@@ -115,14 +159,13 @@ PLAY_SELECTORS = [
 ]
 
 
-def click_play(driver, cursor: GhostCursor, label: str = "main") -> bool:
+def click_play(driver, label: str = "main") -> bool:
     for sel in PLAY_SELECTORS:
         try:
             el = WebDriverWait(driver, 5).until(
                 EC.element_to_be_clickable((By.CSS_SELECTOR, sel))
             )
-            cursor.move_to(el)
-            cursor.click(el)
+            human_move_and_click(driver, el)
             log("HIT", f"Play clicked [{label}] via {sel!r}")
             return True
         except Exception:
@@ -154,7 +197,6 @@ def scrape_video_url(page_url: str) -> dict:
 
     result = {"title": "Unknown", "stream_url": None, "download_urls": [], "error": None}
     driver = build_driver()
-    cursor = GhostCursor(driver)
 
     try:
         driver.header_overrides = {
@@ -191,14 +233,17 @@ def scrape_video_url(page_url: str) -> dict:
         except Exception:
             result["title"] = driver.title
 
-        # Human scroll + ghost cursor random move
-        cursor.move_to_random_point()
+        # Human-like random mouse movement + scroll
+        try:
+            human_move_random(driver)
+        except Exception:
+            pass
         time.sleep(random.uniform(1.0, 2.0))
         driver.execute_script("window.scrollBy(0, window.innerHeight * 0.6);")
         time.sleep(random.uniform(0.8, 1.5))
 
         # Click play on main page
-        click_play(driver, cursor, label="main")
+        click_play(driver, label="main")
         force_play(driver, label="main")
         time.sleep(random.uniform(1.0, 2.0))
 
@@ -211,7 +256,7 @@ def scrape_video_url(page_url: str) -> dict:
                 WebDriverWait(driver, 8).until(
                     lambda d: d.execute_script("return document.readyState") == "complete"
                 )
-                click_play(driver, cursor, label=f"iframe#{idx+1}")
+                click_play(driver, label=f"iframe#{idx+1}")
                 force_play(driver, label=f"iframe#{idx+1}")
                 driver.switch_to.default_content()
             except Exception:
@@ -316,7 +361,7 @@ async def start_cmd(_, message: Message):
     await message.reply_text(
         "👋 **Hanime Downloader Bot**\n\n"
         "Usage: `/dl <hanime.tv URL>`\n\n"
-        "Stack: selenium-wire · selenium-stealth · python-ghost-cursor · yt-dlp"
+        "Stack: undetected-chromedriver · seleniumwire · yt-dlp"
     )
 
 
