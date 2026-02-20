@@ -8,3 +8,4 @@ blinker==1.7.0
 python-ghost-cursor
 bezier
 selenium-stealth
+undetected-chromedriver
