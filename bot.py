@@ -32,7 +32,6 @@ def log(level: str, msg: str) -> None:
 
 # ─── URL VALIDATION ───────────────────────────────────────────────────────────
 
-# Known ad/fake video domains — always reject
 AD_BLACKLIST = re.compile(
     r'(blankmp4s\.pages\.dev|'
     r'adtng\.com|adnxs\.com|adsrvr\.org|advertising\.com|'
@@ -44,7 +43,6 @@ AD_BLACKLIST = re.compile(
     re.IGNORECASE
 )
 
-# Only accept URLs from known hanime/video CDN networks
 HANIME_CDN = re.compile(
     r'(hwcdn\.net|hanime\.tv|videodelivery\.net|mux\.com|'
     r'akamaized\.net|cloudfront\.net|fastly\.net|b-cdn\.net)',
@@ -59,10 +57,8 @@ def is_real_video_url(url: str) -> bool:
         return False
     if AD_BLACKLIST.search(url):
         return False
-    # Must come from a known hanime CDN
     if not HANIME_CDN.search(url):
         return False
-    # Must have a video extension
     if not VIDEO_EXT.search(url):
         return False
     return True
@@ -91,14 +87,11 @@ def build_driver():
     return uc.Chrome(options=options)
 
 
-# ─── JS TRACKER — injected before page loads ──────────────────────────────────
-# Tracks ONLY src assignments on HTMLMediaElement and XHR/fetch calls.
-# We read this after clicking play to get exactly what the player requested.
+# ─── JS TRACKER ───────────────────────────────────────────────────────────────
 
 TRACKER_JS = r"""
 window.__vid_urls = [];
 
-// 1. Intercept video.src = "..." assignments
 (function() {
     const desc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'src');
     if (desc && desc.set) {
@@ -115,7 +108,6 @@ window.__vid_urls = [];
     }
 })();
 
-// 2. Intercept XHR for m3u8/mp4 requests
 (function() {
     const orig = XMLHttpRequest.prototype.open;
     XMLHttpRequest.prototype.open = function(method, url) {
@@ -127,7 +119,6 @@ window.__vid_urls = [];
     };
 })();
 
-// 3. Intercept fetch for m3u8/mp4 requests
 (function() {
     const orig = window.fetch;
     window.fetch = function(input, init) {
@@ -143,65 +134,162 @@ window.__vid_urls = [];
 """
 
 
-# ─── PLAY BUTTON SELECTORS ────────────────────────────────────────────────────
-# Ordered from most specific (VideoJS, which hanime uses) to generic.
-# We do NOT include "video" as a play selector — clicking the video element
-# itself can trigger ad overlays instead of the main player.
+# ─── PLAY SELECTORS — hanime-specific first, then generic fallbacks ───────────
+# Hanime uses a custom Vue player. These selectors target it directly.
 
 PLAY_SELECTORS = [
-    ".vjs-big-play-button",           # VideoJS — hanime's primary player
-    ".plyr__control--overlaid",       # Plyr player
+    # Hanime's own Vue player (most likely matches)
+    ".play-button",
+    ".player-play-button",
+    "div.play-button",
+    "[class*='play-button']",
+    "[class*='PlayButton']",
+    # VideoJS (sometimes used as fallback player on hanime)
+    ".vjs-big-play-button",
+    # Generic
+    ".plyr__control--overlaid",
     "[class*='BigPlayButton']",
     "[class*='big-play-button']",
     "button[class*='play']",
     "[aria-label='Play Video']",
     "[aria-label='Play']",
-    "[class*='play-button']:not(script):not(style)",
+    # Very broad last resort — any clickable with 'play' in class
+    "[class*='play']:not(script):not(style):not(a)",
 ]
+
+# ─── JS-BASED PLAY — directly fires click on every candidate element ──────────
+
+FAST_CLICK_JS = """
+var selectors = [
+    '.play-button', '.player-play-button', '[class*="play-button"]',
+    '[class*="PlayButton"]', '.vjs-big-play-button', '.plyr__control--overlaid',
+    'button[class*="play"]', '[aria-label="Play Video"]', '[aria-label="Play"]'
+];
+var clicked = [];
+for (var s of selectors) {
+    var els = document.querySelectorAll(s);
+    els.forEach(function(el) {
+        if (el && el.offsetParent !== null) {  // visible
+            try { el.click(); clicked.push(s); } catch(e) {}
+        }
+    });
+}
+return clicked;
+"""
 
 
 def click_play_button(driver, label: str = "main") -> bool:
-    for sel in PLAY_SELECTORS:
+    """
+    Two-phase approach:
+      1. Fast JS click on all known selectors simultaneously (< 0.5s)
+      2. Selenium WebDriverWait fallback per selector (up to 5s each, max 3 selectors)
+    """
+    # Phase 1: instant JS click — fires immediately, no waiting
+    try:
+        clicked = driver.execute_script(FAST_CLICK_JS)
+        if clicked:
+            log("HIT", f"JS fast-click [{label}] matched: {clicked}")
+            return True
+    except Exception as e:
+        log("WARN", f"JS fast-click error: {e}")
+
+    # Phase 2: Selenium wait — only try the most likely selectors, short timeout
+    priority_selectors = [
+        ".play-button",
+        "[class*='play-button']",
+        ".vjs-big-play-button",
+        ".plyr__control--overlaid",
+        "button[class*='play']",
+        "[aria-label='Play Video']",
+    ]
+    for sel in priority_selectors:
         try:
-            el = WebDriverWait(driver, 4).until(
+            el = WebDriverWait(driver, 3).until(
                 EC.element_to_be_clickable((By.CSS_SELECTOR, sel))
             )
             if not el.is_displayed():
                 continue
             ActionChains(driver)\
                 .move_to_element_with_offset(el, random.randint(-3, 3), random.randint(-2, 2))\
-                .pause(random.uniform(0.1, 0.25))\
+                .pause(random.uniform(0.05, 0.15))\
                 .click()\
                 .perform()
-            log("HIT", f"Play clicked [{label}] via {sel!r}")
+            log("HIT", f"Selenium click [{label}] via {sel!r}")
             return True
         except Exception:
             continue
+
     return False
 
 
 def js_force_play(driver, label: str = "main") -> None:
+    """Force all video elements to play via JS. Also tries to trigger Vue event handlers."""
     try:
-        driver.execute_script(
-            "document.querySelectorAll('video').forEach(v => {"
-            "  v.muted = false; v.volume = 1; v.play().catch(()=>{});"
-            "});"
-        )
+        driver.execute_script("""
+            // Force HTML5 video play
+            document.querySelectorAll('video').forEach(function(v) {
+                v.muted = false;
+                v.volume = 1;
+                v.play().catch(function(){});
+            });
+
+            // Attempt to trigger Vue click event on play buttons
+            var selectors = [
+                '.play-button', '[class*="play-button"]',
+                '.vjs-big-play-button', 'button[class*="play"]'
+            ];
+            selectors.forEach(function(s) {
+                document.querySelectorAll(s).forEach(function(el) {
+                    try {
+                        // Fire both native click and synthetic MouseEvent
+                        el.click();
+                        el.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true}));
+                    } catch(e) {}
+                });
+            });
+        """)
         log("INFO", f"JS force-play [{label}]")
     except Exception as e:
         log("WARN", f"JS force-play failed: {e}")
 
 
-# ─── READ THE ACTUAL PLAYING VIDEO ───────────────────────────────────────────
+# ─── DOM DUMP for debugging when nothing works ───────────────────────────────
+
+def dump_player_dom(driver) -> None:
+    """Log all elements that might be a play button — helps identify correct selector."""
+    try:
+        elements = driver.execute_script("""
+            var results = [];
+            var all = document.querySelectorAll('*');
+            for (var el of all) {
+                var cls = el.className || '';
+                var tag = el.tagName || '';
+                var label = el.getAttribute('aria-label') || '';
+                if (typeof cls === 'string' &&
+                    (cls.toLowerCase().includes('play') ||
+                     label.toLowerCase().includes('play') ||
+                     tag === 'VIDEO')) {
+                    results.push({
+                        tag: tag,
+                        cls: cls.substring(0, 80),
+                        label: label,
+                        visible: el.offsetParent !== null
+                    });
+                }
+                if (results.length >= 20) break;
+            }
+            return results;
+        """)
+        log("INFO", f"DOM dump — {len(elements)} play-related elements:")
+        for el in (elements or []):
+            log("INFO", f"  <{el['tag']}> class={el['cls']!r} aria-label={el['label']!r} visible={el['visible']}")
+    except Exception as e:
+        log("WARN", f"DOM dump failed: {e}")
+
+
+# ─── READ PLAYING VIDEO ───────────────────────────────────────────────────────
 
 def read_playing_video(driver) -> str | None:
-    """
-    Check all <video> elements on the page.
-    Returns the currentSrc of a video that:
-      - is actually playing (not paused) OR has loaded data
-      - has a duration > 10s (rules out 2-second ad blanks)
-      - has a URL that passes our CDN + extension filter
-    """
     try:
         videos = driver.execute_script("""
             var results = [];
@@ -231,25 +319,18 @@ def read_playing_video(driver) -> str | None:
         log("INFO", f"  <video> paused={v.get('paused')} readyState={v.get('readyState')} "
                     f"dur={dur:.1f}s src={url[:80]}")
 
-    # Pass 1: actively playing, real duration, real CDN URL
     for v in videos:
         url = v.get("currentSrc") or v.get("src") or ""
-        if (not v.get("paused") and
-                v.get("duration", 0) > 10 and
-                is_real_video_url(url)):
+        if (not v.get("paused") and v.get("duration", 0) > 10 and is_real_video_url(url)):
             log("HIT", f"Playing video (dur={v['duration']:.1f}s): {url[:100]}")
             return url
 
-    # Pass 2: loaded (readyState >= 2), real duration, real CDN URL
     for v in videos:
         url = v.get("currentSrc") or v.get("src") or ""
-        if (v.get("readyState", 0) >= 2 and
-                v.get("duration", 0) > 10 and
-                is_real_video_url(url)):
+        if (v.get("readyState", 0) >= 2 and v.get("duration", 0) > 10 and is_real_video_url(url)):
             log("HIT", f"Loaded video (dur={v['duration']:.1f}s): {url[:100]}")
             return url
 
-    # Pass 3: any CDN URL with positive duration (catches HLS where duration may be Infinity)
     for v in videos:
         url = v.get("currentSrc") or v.get("src") or ""
         if v.get("duration", 0) > 0 and is_real_video_url(url):
@@ -260,7 +341,6 @@ def read_playing_video(driver) -> str | None:
 
 
 def read_tracker(driver) -> list[str]:
-    """Read URLs captured by our pre-injected JS tracker."""
     try:
         raw = driver.execute_script("return window.__vid_urls || [];")
         urls = []
@@ -282,15 +362,17 @@ def scrape_video_url(page_url: str) -> dict:
     driver = build_driver()
 
     try:
-        # Inject tracker BEFORE page loads so it catches everything from frame 0
         driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
             "source": TRACKER_JS
         })
         log("INFO", "Tracker pre-injected via CDP")
 
         driver.get(page_url)
-        WebDriverWait(driver, 30).until(
-            lambda d: d.execute_script("return document.readyState") == "complete"
+
+        # Wait for DOM ready — but DON'T wait for full "complete" since hanime is a SPA
+        # and the player loads asynchronously. We just need DOMContentLoaded.
+        WebDriverWait(driver, 20).until(
+            lambda d: d.execute_script("return document.readyState") in ("interactive", "complete")
         )
         log("INFO", f"Page loaded: {driver.title!r}")
 
@@ -308,50 +390,54 @@ def scrape_video_url(page_url: str) -> dict:
             r'\s*[-|]\s*hanime\.tv.*$', '', result["title"], flags=re.IGNORECASE
         ).strip()
 
-        # ── Wait for play button ───────────────────────────────────────────────
-        log("INFO", "Waiting for play button...")
-        for sel in PLAY_SELECTORS:
-            try:
-                WebDriverWait(driver, 10).until(
-                    EC.presence_of_element_located((By.CSS_SELECTOR, sel))
-                )
-                log("INFO", f"Play button ready: {sel!r}")
-                break
-            except Exception:
-                continue
-
+        # ── Scroll down a bit so player is in viewport ────────────────────────
         driver.execute_script("window.scrollBy(0, window.innerHeight * 0.3);")
-        time.sleep(0.3)
+        time.sleep(0.5)
 
-        # ── Click play ────────────────────────────────────────────────────────
-        clicked = click_play_button(driver, label="main")
-        if not clicked:
-            log("WARN", "No play button found — falling back to JS force-play")
-            js_force_play(driver, label="main")
+        # ── FAST: Try JS click immediately, then check tracker (no long waits) ─
+        log("INFO", "Attempting fast JS click...")
+        clicked = click_play_button(driver, label="fast")
 
-        # ── Poll for the real video URL (max 15s) ─────────────────────────────
-        log("INFO", "Polling for real CDN video URL...")
-        stream_url = None
-        deadline = time.time() + 15
+        # Check tracker immediately after click — SPA players load fast
+        time.sleep(1.5)
+        tracked = read_tracker(driver)
+        if tracked:
+            log("HIT", f"Got URL from tracker after fast click: {tracked[0][:100]}")
+            stream_url = tracked[0]
+        else:
+            stream_url = read_playing_video(driver)
 
-        while time.time() < deadline:
-            # Check 1: is the main <video> element actually playing something real?
-            url = read_playing_video(driver)
-            if url:
-                stream_url = url
-                break
-
-            # Check 2: did our tracker catch an m3u8/mp4 request?
-            tracked = read_tracker(driver)
-            if tracked:
-                stream_url = tracked[0]
-                break
-
-            time.sleep(0.4)
-
-        # ── Final fallback: force-play and wait a bit more ────────────────────
+        # ── If still nothing, dump DOM to diagnose and try force-play ─────────
         if not stream_url:
-            log("INFO", "Retrying with JS force-play...")
+            if not clicked:
+                log("WARN", "No play button clicked — dumping DOM for diagnosis")
+                dump_player_dom(driver)
+
+            log("INFO", "Trying JS force-play...")
+            js_force_play(driver, label="main")
+            time.sleep(2.0)
+
+            tracked = read_tracker(driver)
+            stream_url = tracked[0] if tracked else read_playing_video(driver)
+
+        # ── Poll loop (max 10s more, only if still nothing) ───────────────────
+        if not stream_url:
+            log("INFO", "Polling for CDN URL (max 10s)...")
+            deadline = time.time() + 10
+            while time.time() < deadline:
+                url = read_playing_video(driver)
+                if url:
+                    stream_url = url
+                    break
+                tracked = read_tracker(driver)
+                if tracked:
+                    stream_url = tracked[0]
+                    break
+                time.sleep(0.5)
+
+        # ── Final fallback ────────────────────────────────────────────────────
+        if not stream_url:
+            log("INFO", "Final fallback: force-play + 4s wait")
             js_force_play(driver, label="fallback")
             time.sleep(4)
             stream_url = read_playing_video(driver)
@@ -359,7 +445,7 @@ def scrape_video_url(page_url: str) -> dict:
                 tracked = read_tracker(driver)
                 stream_url = tracked[0] if tracked else None
 
-        # ── Collect all valid URLs found ───────────────────────────────────────
+        # ── Collect and rank all URLs ──────────────────────────────────────────
         all_urls = []
         if stream_url:
             all_urls.append(stream_url)
@@ -367,7 +453,6 @@ def scrape_video_url(page_url: str) -> dict:
             if u not in all_urls:
                 all_urls.append(u)
 
-        # Rank: m3u8 (HLS) > mp4 > other
         ordered = (
             [u for u in all_urls if ".m3u8" in u.lower()] +
             [u for u in all_urls if ".mp4"  in u.lower()] +
