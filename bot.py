@@ -308,25 +308,36 @@ def scrape_video_url(page_url: str) -> dict:
 
         # Scroll into view
         driver.execute_script("window.scrollBy(0, window.innerHeight * 0.3);")
-        time.sleep(0.3)
 
-        # ── STEP 1: Click play button ─────────────────────────────────────────
-        log("INFO", "Clicking play button...")
-        if not click_play(driver):
-            log("WARN", "Play button not found")
-
-        # ── STEP 2: Wait for player iframe to load ────────────────────────────
-        log("INFO", "Waiting for player iframe to load...")
+        # STEP 1: Wait for Vue to mount play button, then click
+        log("INFO", "Waiting for play button (Vue mount)...")
+        clicked = False
         try:
-            WebDriverWait(driver, 10).until(
+            WebDriverWait(driver, 15).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "div.play-btn"))
+            )
+            log("INFO", "Play button found — clicking...")
+            clicked = click_play(driver)
+        except Exception:
+            log("WARN", "Play button did not appear within 15s — trying anyway")
+            clicked = click_play(driver)
+
+        if not clicked:
+            log("WARN", "Play button could not be clicked")
+
+        # STEP 2: Wait for player iframe AFTER play click
+        # iframe only appears in DOM after play is clicked
+        log("INFO", "Waiting for player iframe to appear after click...")
+        try:
+            WebDriverWait(driver, 15).until(
                 lambda d: any(
                     PLAYER_DOMAIN.search(f.get_attribute("src") or "")
                     for f in d.find_elements(By.TAG_NAME, "iframe")
                 )
             )
-            log("INFO", "Player iframe loaded")
+            log("INFO", "Player iframe appeared")
         except Exception:
-            log("WARN", "Player iframe wait timed out")
+            log("WARN", "Player iframe did not appear within 15s")
 
         # ── STEP 3: WAY 1 — Extract CDN URL from iframe src (instant) ─────────
         # The iframe src itself contains the CDN URL encoded as a parameter.
@@ -341,16 +352,6 @@ def scrape_video_url(page_url: str) -> dict:
             # Give player 2s to fire its backend request and get response
             time.sleep(2)
             cdn_url = way2_read_response_from_iframe(driver)
-
-        # ── STEP 5: Poll Way2 if still nothing (max 8s) ───────────────────────
-        if not cdn_url:
-            log("INFO", "Polling Way2 (max 8s)...")
-            deadline = time.time() + 8
-            while time.time() < deadline:
-                time.sleep(1)
-                cdn_url = way2_read_response_from_iframe(driver)
-                if cdn_url:
-                    break
 
         result["stream_url"] = cdn_url
         log("INFO", f"Done — URL: {cdn_url[:100] if cdn_url else 'NOT FOUND'}")
