@@ -486,10 +486,12 @@ async def download_with_ytdlp(
         "--no-playlist",
         "--retries", "10",
         "--fragment-retries", "10",
-        "--retry-sleep", "2",
-        "--concurrent-fragments", "4",   # fast parallel downloads
-        "--socket-timeout", "30",        # abort stalled fragments after 30s
-        "--http-chunk-size", "10M",      # larger chunks = fewer requests = faster
+        "--retry-sleep", "1",
+        "--concurrent-fragments", "16",
+        "--socket-timeout", "15",
+        "--http-chunk-size", "20M",
+        "--buffer-size", "16K",
+        "--no-part",
         "--newline", "--progress", "--no-warnings",
         "--add-header", "Referer:https://hanime.tv/",
         "--add-header",
@@ -501,20 +503,56 @@ async def download_with_ytdlp(
         *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
     )
 
-    last_update = time.time()
-    async for raw in process.stdout:
-        line = raw.decode("utf-8", errors="ignore").strip()
-        if not line:
-            continue
-        log("YTDL", line[:120])
-        if "[download]" in line and time.time() - last_update > 5:
-            try:
-                await status_msg.edit_text(f"⬇️ Downloading...\n\n{line}")
-                last_update = time.time()
-            except Exception:
-                pass
+    last_update   = time.time()
+    merging_notified = False
 
-    await process.wait()
+    async def read_output():
+        nonlocal last_update, merging_notified
+        async for raw in process.stdout:
+            line = raw.decode("utf-8", errors="ignore").strip()
+            if not line:
+                continue
+            log("YTDL", line[:120])
+
+            # Detect merge phase — yt-dlp prints this then goes silent for ffmpeg
+            if "[Merger]" in line or "Merging formats" in line or "ffmpeg" in line.lower():
+                if not merging_notified:
+                    merging_notified = True
+                    try:
+                        await status_msg.edit_text("🔀 Merging video & audio... please wait")
+                    except Exception:
+                        pass
+
+            elif "[download]" in line and "%" in line:
+                if time.time() - last_update > 5:
+                    try:
+                        await status_msg.edit_text(f"⬇️ Downloading...\n\n{line}")
+                        last_update = time.time()
+                    except Exception:
+                        pass
+
+    # Run output reader and a periodic heartbeat ping in parallel
+    async def heartbeat():
+        """Ping TG every 30s during silent ffmpeg merge so Heroku doesn't kill us."""
+        while True:
+            await asyncio.sleep(30)
+            if merging_notified:
+                try:
+                    await status_msg.edit_text("🔀 Merging video & audio... please wait")
+                except Exception:
+                    pass
+
+    hb_task = asyncio.create_task(heartbeat())
+    try:
+        await read_output()
+        await process.wait()
+    finally:
+        hb_task.cancel()
+        try:
+            await hb_task
+        except asyncio.CancelledError:
+            pass
+
     if process.returncode != 0:
         log("WARN", f"yt-dlp exited with code {process.returncode}")
         return None
