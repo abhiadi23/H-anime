@@ -399,6 +399,30 @@ def scrape_video_url(page_url: str) -> dict:
         if not clicked:
             log("WARN", "Play button could not be clicked")
 
+        # Dump what is inside the player container after click
+        time.sleep(1)
+        try:
+            inner = driver.execute_script("""
+                var p = document.querySelector('.htv-video-player');
+                if (!p) return [];
+                var results = [];
+                p.querySelectorAll('*').forEach(function(el) {
+                    if (el.offsetParent !== null || el.tagName === 'VIDEO' || el.tagName === 'IFRAME') {
+                        results.push({
+                            tag: el.tagName,
+                            cls: (el.className || '').substring(0, 80),
+                            src: el.src || el.getAttribute('src') || '',
+                            visible: el.offsetParent !== null
+                        });
+                    }
+                });
+                return results.slice(0, 20);
+            """)
+            for el in (inner or []):
+                log("INFO", f"  player child: <{el['tag']}> cls={el['cls']!r} src={el['src'][:60]!r} visible={el['visible']}")
+        except Exception as e:
+            log("WARN", f"inner dump error: {e}")
+
         # STEP 2: Wait for player iframe AFTER play click
         # iframe only appears in DOM after play is clicked
         log("INFO", "Waiting for player iframe to appear after click...")
