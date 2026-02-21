@@ -9,3 +9,4 @@ python-ghost-cursor
 bezier
 selenium-stealth
 undetected-chromedriver
+curl_cffi
