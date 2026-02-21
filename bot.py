@@ -56,6 +56,36 @@ def is_real_video_url(url: str) -> bool:
 
 # ─── DRIVER ───────────────────────────────────────────────────────────────────
 
+def get_cf_cookies(url: str) -> dict:
+    """
+    Use curl_cffi to make the first request to hanime.tv.
+    curl_cffi impersonates Chrome TLS fingerprint (JA3/JA4) exactly,
+    which is what Cloudflare checks before running any JS challenge.
+    Returns cookies from the response to inject into Selenium.
+    """
+    from curl_cffi import requests as cf_requests
+    log("INFO", "curl_cffi: fetching page to get CF cookies...")
+    try:
+        resp = cf_requests.get(
+            url,
+            impersonate="chrome120",
+            timeout=30,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "                              "AppleWebKit/537.36 (KHTML, like Gecko) "                              "Chrome/120.0.0.0 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Accept-Encoding": "gzip, deflate, br",
+                "Referer": "https://hanime.tv/",
+            }
+        )
+        log("INFO", f"curl_cffi: status={resp.status_code} cookies={list(resp.cookies.keys())}")
+        # Return cookies as dict for injection into Selenium
+        return dict(resp.cookies)
+    except Exception as e:
+        log("WARN", f"curl_cffi failed: {e}")
+        return {}
+
+
 def build_driver():
     options = uc.ChromeOptions()
     options.add_argument("--headless=new")
@@ -71,7 +101,29 @@ def build_driver():
     options.add_argument("--mute-audio")
     options.add_argument("--no-first-run")
     options.add_argument("--disable-software-rasterizer")
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_argument(
+        "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    )
     return uc.Chrome(options=options)
+
+
+def inject_cf_cookies(driver, cookies: dict) -> None:
+    """Inject curl_cffi CF cookies into Selenium so it passes CF checks."""
+    if not cookies:
+        return
+    for name, value in cookies.items():
+        try:
+            driver.add_cookie({
+                "name": name,
+                "value": value,
+                "domain": ".hanime.tv",
+                "path": "/",
+            })
+        except Exception as e:
+            log("WARN", f"Cookie inject {name}: {e}")
+    log("INFO", f"Injected {len(cookies)} CF cookies into Selenium")
 
 
 # ─── WAY 2: XHR/FETCH RESPONSE INTERCEPTION ──────────────────────────────────
@@ -277,19 +329,34 @@ def scrape_video_url(page_url: str) -> dict:
 
     try:
         # Inject response tracker into ALL frames before any page JS runs
-        # This covers the player iframe so it captures XHR/fetch responses from frame 0
         driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument",
                                 {"source": RESPONSE_TRACKER_JS})
         log("INFO", "Response tracker injected via CDP")
 
-        # Load cookies for login
+        # STEP 0: curl_cffi bypass — get CF clearance cookies via TLS impersonation
+        # curl_cffi mimics Chrome120 TLS fingerprint (JA3/JA4) exactly.
+        # Cloudflare checks this BEFORE serving any JS challenge.
+        # We fetch the page with curl_cffi first, grab the cf_clearance cookie,
+        # then inject it into Selenium so Chrome passes the CF check too.
+        cf_cookies = get_cf_cookies(page_url)
+
+        # Navigate to hanime.tv domain so we can set cookies
+        driver.get("https://hanime.tv")
+        WebDriverWait(driver, 10).until(
+            lambda d: d.execute_script("return document.readyState") == "complete"
+        )
+
+        # Inject CF cookies from curl_cffi into Selenium
+        inject_cf_cookies(driver, cf_cookies)
+
+        # Also load login cookies if available
         load_cookies(driver, COOKIES_FILE)
 
-        # Re-inject after cookie navigation
+        # Re-inject tracker after navigations
         driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument",
                                 {"source": RESPONSE_TRACKER_JS})
 
-        # Navigate to video page
+        # Navigate to video page — now with CF cookies already set
         driver.get(page_url)
         WebDriverWait(driver, 20).until(
             lambda d: d.execute_script("return document.readyState") in ("interactive", "complete")
