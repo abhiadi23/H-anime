@@ -35,10 +35,12 @@ def log(level: str, msg: str) -> None:
 
 HANIME_CDN = re.compile(
     r'(hwcdn\.net|hanime\.tv|videodelivery\.net|mux\.com|'
-    r'akamaized\.net|cloudfront\.net|fastly\.net|b-cdn\.net|hanime-cdn\.com)',
+    r'akamaized\.net|cloudfront\.net|fastly\.net|b-cdn\.net|hanime-cdn\.com|'
+    r'highwinds-cdn\.com|m3u8s\.|freeanimehentai\.net)',
     re.IGNORECASE
 )
-VIDEO_EXT = re.compile(r'\.(m3u8|mp4|mkv|ts|m4v|webm)(\?|#|$)', re.IGNORECASE)
+# Match video extensions — also catch truncated .m3u8 that got cut to .m
+VIDEO_EXT = re.compile(r'\.(m3u8|mp4|mkv|ts|m4v|webm|m3u)(\?|#|$)|/m3u8s/', re.IGNORECASE)
 
 # The real omni-player iframe domain
 OMNI_PLAYER = re.compile(r'hanime\.tv/omni-player', re.IGNORECASE)
@@ -183,8 +185,29 @@ NETWORK_INTERCEPT_JS = r"""
     window.__cdn_urls     = [];   // METHOD 1: network tab (request URLs)
     window.__cdn_backend  = [];   // METHOD 2: backend response body
 
+    function isVideoUrl(url) {
+        return /\.(m3u8|mp4|ts|m4v|mkv|webm)(\?|#|$)/i.test(url) || /\/m3u8s\//i.test(url);
+    }
+
+    function isVideoCt(ct) {
+        return ct.includes('video') || ct.includes('mpegurl') || ct.includes('octet-stream');
+    }
+
+    // Extract all CDN video URLs from a block of text (response body / JSON)
+    // Uses a generous pattern — stops at whitespace or unbalanced quote only
+    function extractCdnUrls(text) {
+        var found = [];
+        // Match full URL including query string, stop at whitespace / quote / angle bracket
+        var re = /https?:\/\/[^\s"'<>\\]+/gi;
+        var m;
+        while ((m = re.exec(text)) !== null) {
+            var u = m[0].replace(/[.,;)\]]+$/, ''); // strip trailing punctuation
+            if (isVideoUrl(u)) found.push(u);
+        }
+        return found;
+    }
+
     // ── METHOD 1: Intercept outgoing request URLs ─────────────────────────
-    // Catches direct CDN requests (m3u8, mp4) made by the player
     var _origOpen = XMLHttpRequest.prototype.open;
     XMLHttpRequest.prototype.open = function(method, url) {
         this.__req_url = url || '';
@@ -195,27 +218,21 @@ NETWORK_INTERCEPT_JS = r"""
     XMLHttpRequest.prototype.send = function(body) {
         var xhr  = this;
         var url  = xhr.__req_url || '';
-        // Log the request URL immediately (Method 1: network tab)
-        if (/\.(m3u8|mp4|ts|m4v|mkv|webm)(\?|#|$)/i.test(url)) {
+        if (isVideoUrl(url)) {
             window.__cdn_urls.push({ url: url, via: 'xhr-req' });
         }
         xhr.addEventListener('readystatechange', function() {
             if (xhr.readyState === 4 && xhr.status >= 200 && xhr.status < 300) {
                 var ct = xhr.getResponseHeader('Content-Type') || '';
-                // Method 1: catch video content-type responses
-                var isVideoCt = ct.includes('video') || ct.includes('mpegurl') || ct.includes('octet-stream');
-                if (isVideoCt && url) {
+                if (isVideoCt(ct) && url) {
                     window.__cdn_urls.push({ url: url, via: 'xhr-resp-ct', ct: ct });
                 }
-                // Method 2: scan response text for CDN URLs the backend returned
+                // Method 2: scan response text for CDN URLs
                 try {
-                    var text = xhr.responseText || '';
-                    var matches = text.match(/https?:\/\/[^\s"'<>,]+\.(m3u8|mp4|ts|m4v|mkv|webm)[^\s"'<>,]*/gi);
-                    if (matches) {
-                        matches.forEach(function(m) {
-                            window.__cdn_backend.push({ url: m, via: 'xhr-body', src_url: url });
-                        });
-                    }
+                    var matches = extractCdnUrls(xhr.responseText || '');
+                    matches.forEach(function(u) {
+                        window.__cdn_backend.push({ url: u, via: 'xhr-body', src_url: url });
+                    });
                 } catch(e) {}
             }
         });
@@ -226,27 +243,22 @@ NETWORK_INTERCEPT_JS = r"""
     var _origFetch = window.fetch;
     window.fetch = function(input, init) {
         var url = typeof input === 'string' ? input : (input && input.url) || '';
-        // Method 1: request URL
-        if (/\.(m3u8|mp4|ts|m4v|mkv|webm)(\?|#|$)/i.test(url)) {
+        if (isVideoUrl(url)) {
             window.__cdn_urls.push({ url: url, via: 'fetch-req' });
         }
         return _origFetch.apply(this, arguments).then(function(resp) {
             try {
                 var ct = resp.headers.get('Content-Type') || '';
-                var isVideoCt = ct.includes('video') || ct.includes('mpegurl') || ct.includes('octet-stream');
-                // Method 1: video content type
-                if (resp.ok && isVideoCt && url) {
+                if (resp.ok && isVideoCt(ct) && url) {
                     window.__cdn_urls.push({ url: url, via: 'fetch-resp-ct', ct: ct });
                 }
-                // Method 2: clone and scan response body for CDN URLs
+                // Method 2: scan response body
                 if (resp.ok) {
                     resp.clone().text().then(function(text) {
-                        var matches = text.match(/https?:\/\/[^\s"'<>,]+\.(m3u8|mp4|ts|m4v|mkv|webm)[^\s"'<>,]*/gi);
-                        if (matches) {
-                            matches.forEach(function(m) {
-                                window.__cdn_backend.push({ url: m, via: 'fetch-body', src_url: url });
-                            });
-                        }
+                        var matches = extractCdnUrls(text);
+                        matches.forEach(function(u) {
+                            window.__cdn_backend.push({ url: u, via: 'fetch-body', src_url: url });
+                        });
                     }).catch(function(){});
                 }
             } catch(e) {}
@@ -516,29 +528,41 @@ def scrape_video_url(page_url: str) -> dict:
         except Exception as e:
             log("WARN", f"Player container not found: {e}")
 
-        # ── STEP 3: METHOD 1 — Check network tab (outgoing request URLs) ──────
-        # Give the player a moment to fire its CDN requests
-        log("INFO", "Method1: checking network tab for CDN request URLs...")
+        # Give the player a moment to fire its initial requests after click
         time.sleep(2)
+        cdn_url = None
+        method_used = None
+
+        # ── STEP 3: METHOD 1 — Network tab (outgoing request URLs) ───────────
+        log("INFO", "Method1: checking network tab for direct CDN request URLs...")
         cdn_url = method1_network_tab(driver)
+        if cdn_url:
+            method_used = "Method1 (network tab)"
 
-        # ── STEP 4: METHOD 2 — Check backend response body ────────────────────
+        # ── STEP 4: METHOD 2 — Backend response body ──────────────────────────
         if not cdn_url:
-            log("INFO", "Method2: checking backend response bodies...")
+            log("INFO", "Method2: checking backend response bodies for CDN URLs...")
             cdn_url = method2_backend_response(driver)
+            if cdn_url:
+                method_used = "Method2 (backend response body)"
 
-        # ── STEP 5: METHOD 3 — Scan player iframe ─────────────────────────────
+        # ── STEP 5: METHOD 3 — Player iframe scan ─────────────────────────────
         if not cdn_url:
             log("INFO", "Method3: waiting for player iframe then scanning...")
             found = wait_for_player_iframe(driver, timeout=12)
             if not found:
                 log("WARN", "Real player iframe did not appear")
-            # Give iframe a moment to fire its own requests
-            time.sleep(2)
-            cdn_url = method3_iframe_scan(driver)
+            else:
+                time.sleep(2)
+                cdn_url = method3_iframe_scan(driver)
+                if cdn_url:
+                    method_used = "Method3 (player iframe)"
 
         result["stream_url"] = cdn_url
-        log("INFO", f"Done — URL: {cdn_url[:100] if cdn_url else 'NOT FOUND'}")
+        if cdn_url:
+            log("HIT", f"CDN URL found via {method_used}: {cdn_url[:100]}")
+        else:
+            log("WARN", "All 3 methods exhausted — CDN URL NOT FOUND")
         log("INFO", f"Title: {result['title']!r}")
 
     except Exception as e:
