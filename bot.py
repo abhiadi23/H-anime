@@ -81,7 +81,6 @@ def get_cf_cookies(url: str) -> dict:
         )
         cookies = dict(session.cookies)
         log("INFO", f"curl_cffi: status={resp.status_code} cookies={list(cookies.keys())}")
-
         if not cookies:
             for r in list(resp.history) + [resp]:
                 for h_key, h_val in r.headers.items():
@@ -93,7 +92,6 @@ def get_cf_cookies(url: str) -> dict:
                         except Exception:
                             pass
             log("INFO", f"curl_cffi fallback header parse: {list(cookies.keys())}")
-
         return cookies
     except Exception as e:
         log("WARN", f"curl_cffi failed: {e}")
@@ -144,15 +142,15 @@ def inject_cf_cookies(driver, cookies: dict) -> None:
     log("INFO", f"Injected {injected}/{len(cookies)} CF cookies into Selenium")
 
 
-# ─── NETWORK INTERCEPTOR (Method 2 only — backend response body scanner) ─────
-#
-# Scans XHR/fetch response bodies for CDN video URLs embedded in API responses.
-# Vue calls /api/v8/guest/videos/{id}/ on page mount, which contains all stream URLs.
+# ─── NETWORK INTERCEPTOR ──────────────────────────────────────────────────────
+# Injects into every frame via CDP before any page JS runs.
+# Scans every XHR/fetch response body for embedded CDN video URLs.
+# Stores results in window.__cdn_backend.
 
 NETWORK_INTERCEPT_JS = r"""
 (function() {
-    if (window.__cdn_backend_init) return;
-    window.__cdn_backend_init = true;
+    if (window.__cdn_urls_init) return;
+    window.__cdn_urls_init = true;
     window.__cdn_backend = [];
 
     function isVideoUrl(url) {
@@ -170,13 +168,12 @@ NETWORK_INTERCEPT_JS = r"""
         return found;
     }
 
-    // ── XHR interception ─────────────────────────────────────────────────────
+    // XHR
     var _origOpen = XMLHttpRequest.prototype.open;
     XMLHttpRequest.prototype.open = function(method, url) {
         this.__req_url = url || '';
         return _origOpen.apply(this, arguments);
     };
-
     var _origSend = XMLHttpRequest.prototype.send;
     XMLHttpRequest.prototype.send = function(body) {
         var xhr = this;
@@ -193,7 +190,7 @@ NETWORK_INTERCEPT_JS = r"""
         return _origSend.apply(this, arguments);
     };
 
-    // ── fetch interception ────────────────────────────────────────────────────
+    // fetch
     var _origFetch = window.fetch;
     window.fetch = function(input, init) {
         var url = typeof input === 'string' ? input : (input && input.url) || '';
@@ -219,7 +216,6 @@ NETWORK_INTERCEPT_JS = r"""
 def method2_backend_response(driver, retries: int = 4, delay: float = 1.0) -> str | None:
     """
     Read window.__cdn_backend — CDN URLs extracted from API response bodies.
-    Vue calls /api/v8/guest/videos/{id}/ on mount with all stream URLs in response.
     Retries because fetch().then(text()) resolves asynchronously.
     """
     for attempt in range(retries):
@@ -231,7 +227,7 @@ def method2_backend_response(driver, retries: int = 4, delay: float = 1.0) -> st
                 src = item.get("src_url", "") if isinstance(item, dict) else ""
                 log("INFO", f"M2 [{via}] from={src[:60]}: {url[:100]}")
                 if is_real_video_url(url):
-                    log("HIT", f"Method2 backend response: {url[:120]}")
+                    log("HIT", f"Method2 found CDN URL: {url[:120]}")
                     return url
             if attempt < retries - 1:
                 log("INFO", f"M2 no hit yet, retry {attempt + 1}/{retries - 1}...")
@@ -274,6 +270,106 @@ def load_cookies(driver, cookies_file: str) -> bool:
         return False
 
 
+# ─── AD REMOVAL ───────────────────────────────────────────────────────────────
+
+def remove_ads(driver) -> None:
+    """
+    Nuke all known ad elements. Called before AND after play click.
+    MutationObserver blocks future ad injections (never touches omni-player).
+    """
+    driver.execute_script("""
+        var adSelectors = [
+            'iframe[src*="googlesyndication"]',
+            'iframe[src*="doubleclick"]',
+            'iframe[src*="adservice"]',
+            'iframe[src*="adsystem"]',
+            'iframe[src*="advertising"]',
+            'iframe[src*="adnxs"]',
+            'iframe[src*="ad."]',
+            '.ad-container', '.ad-wrapper', '.ad-slot',
+            '.banner-ad', '.vertical-ad', '.hvp-adslot',
+            '#ad-container', '#ad-banner', '#adsense',
+            '[id*="google_ads"]', '[class*="google-ad"]',
+            '[class*="dfp-ad"]', '[class*="ad-unit"]',
+            'ins.adsbygoogle'
+        ];
+        var removed = 0;
+        adSelectors.forEach(function(sel) {
+            try {
+                document.querySelectorAll(sel).forEach(function(el) {
+                    el.remove(); removed++;
+                });
+            } catch(e) {}
+        });
+        if (!window.__adObserverActive) {
+            window.__adObserverActive = true;
+            try {
+                new MutationObserver(function(mutations) {
+                    mutations.forEach(function(m) {
+                        m.addedNodes.forEach(function(node) {
+                            if (!node.tagName) return;
+                            var src = (node.src || (node.getAttribute && node.getAttribute('src')) || '').toLowerCase();
+                            var cls = (node.className || '').toLowerCase();
+                            if (src.includes('omni-player')) return;
+                            if (src.includes('googlesyndication') || src.includes('doubleclick') ||
+                                src.includes('adnxs') || src.includes('adservice') ||
+                                cls.includes('ad-slot') || cls.includes('ad-unit') ||
+                                cls.includes('hvp-adslot')) {
+                                try { node.remove(); } catch(e) {}
+                            }
+                        });
+                    });
+                }).observe(document.body, { childList: true, subtree: true });
+            } catch(e) {}
+        }
+        console.log('[AdKill] removed', removed, 'ad elements');
+    """)
+    log("INFO", "Ads removed from DOM")
+
+
+# ─── PLAY BUTTON ──────────────────────────────────────────────────────────────
+
+def find_and_click_play(driver) -> bool:
+    PLAY_SELECTORS = [
+        ".htv-video-player .play-btn",
+        ".htv-video-player .vjs-big-play-button",
+        ".htv-video-player .play-button",
+        ".htv-video-player video",
+        "div.play-btn",
+        ".play-btn",
+    ]
+    for sel in PLAY_SELECTORS:
+        try:
+            btn = driver.find_element(By.CSS_SELECTOR, sel)
+            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
+            driver.execute_script("arguments[0].click();", btn)
+            log("HIT", f"Clicked play: {sel!r}")
+            return True
+        except Exception:
+            continue
+
+    try:
+        player = driver.find_element(By.CSS_SELECTOR, ".htv-video-player")
+        driver.execute_script("""
+            arguments[0].dispatchEvent(new MouseEvent('click', {
+                bubbles: true, cancelable: true, view: window
+            }));
+        """, player)
+        log("HIT", "Clicked play: dispatched MouseEvent on .htv-video-player")
+        return True
+    except Exception:
+        pass
+
+    try:
+        driver.execute_script("var v = document.querySelector('video'); if (v) v.play();")
+        log("HIT", "Clicked play: called video.play() directly")
+        return True
+    except Exception:
+        pass
+
+    return False
+
+
 # ─── MAIN SCRAPER ─────────────────────────────────────────────────────────────
 
 def scrape_video_url(page_url: str) -> dict:
@@ -282,31 +378,29 @@ def scrape_video_url(page_url: str) -> dict:
     driver = build_driver()
 
     try:
-        # Inject network interceptor into every frame before any JS runs
+        # Inject interceptor into every frame before any JS runs
         driver.execute_cdp_cmd(
             "Page.addScriptToEvaluateOnNewDocument",
             {"source": NETWORK_INTERCEPT_JS}
         )
         log("INFO", "Network interceptor injected via CDP")
 
-        # ── CF bypass ─────────────────────────────────────────────────────────
+        # CF bypass
         cf_cookies = get_cf_cookies(page_url)
-
         driver.get("https://hanime.tv")
         WebDriverWait(driver, 10).until(
             lambda d: d.execute_script("return document.readyState") == "complete"
         )
-
         inject_cf_cookies(driver, cf_cookies)
         load_cookies(driver, COOKIES_FILE)
 
-        # Re-register interceptor for subsequent navigations
+        # Re-register for subsequent navigations
         driver.execute_cdp_cmd(
             "Page.addScriptToEvaluateOnNewDocument",
             {"source": NETWORK_INTERCEPT_JS}
         )
 
-        # ── Navigate to video page ─────────────────────────────────────────────
+        # Navigate to video page
         driver.get(page_url)
         WebDriverWait(driver, 20).until(
             lambda d: d.execute_script("return document.readyState") in ("interactive", "complete")
@@ -329,25 +423,37 @@ def scrape_video_url(page_url: str) -> dict:
 
         driver.execute_script("window.scrollBy(0, window.innerHeight * 0.3);")
 
-        # ══════════════════════════════════════════════════════════════════════
-        # Method 2 EARLY — Vue calls /api/v8/guest/videos/{id}/ on page mount.
-        # The JSON response contains all CDN stream URLs — grab it immediately.
-        # ══════════════════════════════════════════════════════════════════════
-        log("INFO", "Method2 early: checking page-load API response...")
-        time.sleep(2)
-        cdn_url = method2_backend_response(driver, retries=5, delay=1.0)
+        # ── Wait for player, remove ads, click play ────────────────────────────
+        log("INFO", "Waiting for player container...")
+        try:
+            WebDriverWait(driver, 10).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, ".htv-video-player"))
+            )
+            remove_ads(driver)       # before click
+            time.sleep(0.5)
 
-        if not cdn_url:
-            # ── Wait a bit longer for slower connections / Vue hydration ──────
-            log("INFO", "Method2: waiting longer for Vue API call to complete...")
-            time.sleep(3)
-            cdn_url = method2_backend_response(driver, retries=4, delay=1.5)
+            log("INFO", "Player container found — clicking play...")
+            clicked = find_and_click_play(driver)
+            if not clicked:
+                log("WARN", "Could not click any play button")
+
+            time.sleep(1)
+            remove_ads(driver)       # after click — clears overlay ads
+        except Exception as e:
+            log("WARN", f"Player container not found: {e}")
+
+        # Give player time to fire post-click network requests
+        time.sleep(2)
+
+        # ── Method 2: Backend response body ───────────────────────────────────
+        log("INFO", "Method2: checking backend response bodies...")
+        cdn_url = method2_backend_response(driver, retries=4, delay=1.0)
 
         result["stream_url"] = cdn_url
         if cdn_url:
-            log("HIT", f"CDN URL found via Method2: {cdn_url[:100]}")
+            log("HIT", f"CDN URL found: {cdn_url[:100]}")
         else:
-            log("WARN", "Method2 exhausted — CDN URL NOT FOUND (login may be required)")
+            log("WARN", "CDN URL NOT FOUND — login may be required")
         log("INFO", f"Title: {result['title']!r}")
 
     except Exception as e:
@@ -362,7 +468,7 @@ def scrape_video_url(page_url: str) -> dict:
     return result
 
 
-# ─── YT-DLP DOWNLOADER (fast: 16 concurrent fragments) ───────────────────────
+# ─── YT-DLP DOWNLOADER ────────────────────────────────────────────────────────
 
 async def download_with_ytdlp(
     cdn_url: str, title: str, session_id: str, status_msg: Message
@@ -379,10 +485,11 @@ async def download_with_ytdlp(
         "--merge-output-format", "mp4",
         "--no-playlist",
         "--retries", "10",
-        "--fragment-retries", "20",
-        "--concurrent-fragments", "16",   # ← max parallel fragment downloads
-        "--buffer-size", "16K",
-        "--http-chunk-size", "10M",
+        "--fragment-retries", "10",
+        "--retry-sleep", "2",
+        "--concurrent-fragments", "4",   # fast parallel downloads
+        "--socket-timeout", "30",        # abort stalled fragments after 30s
+        "--http-chunk-size", "10M",      # larger chunks = fewer requests = faster
         "--newline", "--progress", "--no-warnings",
         "--add-header", "Referer:https://hanime.tv/",
         "--add-header",
@@ -397,6 +504,9 @@ async def download_with_ytdlp(
     last_update = time.time()
     async for raw in process.stdout:
         line = raw.decode("utf-8", errors="ignore").strip()
+        if not line:
+            continue
+        log("YTDL", line[:120])
         if "[download]" in line and time.time() - last_update > 5:
             try:
                 await status_msg.edit_text(f"⬇️ Downloading...\n\n{line}")
@@ -406,6 +516,7 @@ async def download_with_ytdlp(
 
     await process.wait()
     if process.returncode != 0:
+        log("WARN", f"yt-dlp exited with code {process.returncode}")
         return None
 
     files = sorted(
@@ -464,9 +575,7 @@ async def dl_cmd(client: Client, message: Message):
     title   = data["title"]
 
     if not cdn_url:
-        await status.edit_text(
-            "❌ No CDN URL found. Login may be required.", parse_mode=PM
-        )
+        await status.edit_text("❌ No CDN URL found. Login may be required.", parse_mode=PM)
         return
 
     await status.edit_text(
