@@ -240,12 +240,16 @@ def load_cookies(driver, cookies_file: str) -> bool:
 # ─── PLAY BUTTON ──────────────────────────────────────────────────────────────
 
 PLAY_SELECTORS = [
+    # Confirmed from DOM: player container is always visible even without login
+    # Clicking the container triggers the play action in Vue
+    ".htv-video-player",          # player container — click triggers play
+    "div.htv-video-player",
+    # Inner play button (only appears after full Vue mount)
     "div.play-btn",
     ".play-btn",
     ".htv-video-player .play-btn",
     "[class*='play-btn']",
     ".vjs-big-play-button",
-    "button[class*='play']",
     "[aria-label='Play Video']",
 ]
 
@@ -310,40 +314,19 @@ def scrape_video_url(page_url: str) -> dict:
         driver.execute_script("window.scrollBy(0, window.innerHeight * 0.3);")
 
         # STEP 1: Wait for Vue to mount play button, then click
-        log("INFO", "Waiting for play button (Vue mount)...")
+        log("INFO", "Waiting for player container to appear...")
 
-        # Dump ALL clickable/interactive elements to find real play button selector
-        time.sleep(3)  # let Vue hydrate
-        try:
-            dump = driver.execute_script("""
-                var results = [];
-                var all = document.querySelectorAll('button, [class*=play], [class*=Play], [role=button], video, .player, [class*=player], [class*=Player]');
-                all.forEach(function(el) {
-                    results.push({
-                        tag: el.tagName,
-                        cls: (el.className || '').substring(0, 80),
-                        id: el.id || '',
-                        role: el.getAttribute('role') || '',
-                        visible: el.offsetParent !== null,
-                        text: (el.innerText || '').substring(0, 30)
-                    });
-                });
-                return results.slice(0, 30);
-            """)
-            for el in (dump or []):
-                log("INFO", f"DOM: <{el['tag']}> cls={el['cls']!r} id={el['id']!r} visible={el['visible']} text={el['text']!r}")
-        except Exception as e:
-            log("WARN", f"DOM dump error: {e}")
-
+        # Wait for the player container (always present even without login)
+        # then click it — this triggers the play action in Vue
         clicked = False
         try:
-            WebDriverWait(driver, 15).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, "div.play-btn"))
+            WebDriverWait(driver, 10).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, ".htv-video-player"))
             )
-            log("INFO", "Play button found — clicking...")
+            log("INFO", "Player container found — clicking...")
             clicked = click_play(driver)
         except Exception:
-            log("WARN", "Play button did not appear within 15s — trying anyway")
+            log("WARN", "Player container not found within 10s")
             clicked = click_play(driver)
 
         if not clicked:
