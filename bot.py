@@ -292,17 +292,10 @@ def load_cookies(driver, cookies_file: str) -> bool:
 # ─── PLAY BUTTON ──────────────────────────────────────────────────────────────
 
 PLAY_SELECTORS = [
-    # Confirmed from DOM: player container is always visible even without login
-    # Clicking the container triggers the play action in Vue
-    ".htv-video-player",          # player container — click triggers play
-    "div.htv-video-player",
-    # Inner play button (only appears after full Vue mount)
+    # Confirmed from DOM dump: play-btn is inside htv-video-player
+    ".htv-video-player .play-btn",   # ← exact confirmed selector
     "div.play-btn",
     ".play-btn",
-    ".htv-video-player .play-btn",
-    "[class*='play-btn']",
-    ".vjs-big-play-button",
-    "[aria-label='Play Video']",
 ]
 
 
@@ -387,41 +380,21 @@ def scrape_video_url(page_url: str) -> dict:
         # then click it — this triggers the play action in Vue
         clicked = False
         try:
+            # Wait for play-btn to appear inside the player container
             WebDriverWait(driver, 10).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, ".htv-video-player"))
+                EC.presence_of_element_located((By.CSS_SELECTOR, ".htv-video-player .play-btn"))
             )
-            log("INFO", "Player container found — clicking...")
-            clicked = click_play(driver)
-        except Exception:
-            log("WARN", "Player container not found within 10s")
-            clicked = click_play(driver)
+            log("INFO", "Play button found — clicking...")
+            # Click directly using JS on the confirmed element
+            btn = driver.find_element(By.CSS_SELECTOR, ".htv-video-player .play-btn")
+            driver.execute_script("arguments[0].click();", btn)
+            log("HIT", "Clicked .htv-video-player .play-btn")
+            clicked = True
+        except Exception as e:
+            log("WARN", f"Play button not found: {e}")
 
         if not clicked:
             log("WARN", "Play button could not be clicked")
-
-        # Dump what is inside the player container after click
-        time.sleep(1)
-        try:
-            inner = driver.execute_script("""
-                var p = document.querySelector('.htv-video-player');
-                if (!p) return [];
-                var results = [];
-                p.querySelectorAll('*').forEach(function(el) {
-                    if (el.offsetParent !== null || el.tagName === 'VIDEO' || el.tagName === 'IFRAME') {
-                        results.push({
-                            tag: el.tagName,
-                            cls: (el.className || '').substring(0, 80),
-                            src: el.src || el.getAttribute('src') || '',
-                            visible: el.offsetParent !== null
-                        });
-                    }
-                });
-                return results.slice(0, 20);
-            """)
-            for el in (inner or []):
-                log("INFO", f"  player child: <{el['tag']}> cls={el['cls']!r} src={el['src'][:60]!r} visible={el['visible']}")
-        except Exception as e:
-            log("WARN", f"inner dump error: {e}")
 
         # STEP 2: Wait for player iframe AFTER play click
         # iframe only appears in DOM after play is clicked
