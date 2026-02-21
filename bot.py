@@ -311,6 +311,30 @@ def scrape_video_url(page_url: str) -> dict:
 
         # STEP 1: Wait for Vue to mount play button, then click
         log("INFO", "Waiting for play button (Vue mount)...")
+
+        # Dump ALL clickable/interactive elements to find real play button selector
+        time.sleep(3)  # let Vue hydrate
+        try:
+            dump = driver.execute_script("""
+                var results = [];
+                var all = document.querySelectorAll('button, [class*=play], [class*=Play], [role=button], video, .player, [class*=player], [class*=Player]');
+                all.forEach(function(el) {
+                    results.push({
+                        tag: el.tagName,
+                        cls: (el.className || '').substring(0, 80),
+                        id: el.id || '',
+                        role: el.getAttribute('role') || '',
+                        visible: el.offsetParent !== null,
+                        text: (el.innerText || '').substring(0, 30)
+                    });
+                });
+                return results.slice(0, 30);
+            """)
+            for el in (dump or []):
+                log("INFO", f"DOM: <{el['tag']}> cls={el['cls']!r} id={el['id']!r} visible={el['visible']} text={el['text']!r}")
+        except Exception as e:
+            log("WARN", f"DOM dump error: {e}")
+
         clicked = False
         try:
             WebDriverWait(driver, 15).until(
