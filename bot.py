@@ -15,7 +15,7 @@ from selenium.webdriver.support import expected_conditions as EC
 import undetected_chromedriver as uc
 
 DOWNLOAD_DIR = "./downloads"
-COOKIES_FILE = "./cookies.json"
+COOKIES_FILE  = "./cookies.json"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 
@@ -23,7 +23,7 @@ def html_esc(text: str) -> str:
     return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-PM = enums.ParseMode.HTML
+PM  = enums.ParseMode.HTML
 app = Client("hanime_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
 
@@ -39,11 +39,12 @@ HANIME_CDN = re.compile(
     r'highwinds-cdn\.com|m3u8s\.|freeanimehentai\.net)',
     re.IGNORECASE
 )
-# Match video extensions — also catch truncated .m3u8 that got cut to .m
-VIDEO_EXT = re.compile(r'\.(m3u8|mp4|mkv|ts|m4v|webm|m3u)(\?|#|$)|/m3u8s/', re.IGNORECASE)
-
-# The real omni-player iframe domain
+VIDEO_EXT = re.compile(
+    r'\.(m3u8|mp4|mkv|ts|m4v|webm|m3u)(\?|#|$)|/m3u8s/',
+    re.IGNORECASE
+)
 OMNI_PLAYER = re.compile(r'hanime\.tv/omni-player', re.IGNORECASE)
+
 
 def is_real_video_url(url: str) -> bool:
     if not url or not url.startswith("http"):
@@ -61,23 +62,20 @@ def is_real_player_iframe(frame) -> bool:
     """Return True for any omni-player iframe regardless of CSS classes."""
     try:
         src = frame.get_attribute("src") or ""
-        if not OMNI_PLAYER.search(src):
-            return False
-        return True
+        return bool(OMNI_PLAYER.search(src))
     except Exception:
         return False
 
 
-# ─── DRIVER ───────────────────────────────────────────────────────────────────
+# ─── CLOUDFLARE BYPASS ────────────────────────────────────────────────────────
 
 def get_cf_cookies(url: str) -> dict:
     """
-    Use curl_cffi to impersonate Chrome TLS fingerprint (JA3/JA4).
+    Use curl_cffi to impersonate Chrome120 TLS fingerprint (JA3/JA4).
     Cloudflare checks this before running any JS challenge.
-    We follow redirects and grab all set-cookie headers.
+    Returns cookies to inject into Selenium.
     """
     from curl_cffi import requests as cf_requests
-
     log("INFO", "curl_cffi: fetching page to get CF cookies...")
     try:
         session = cf_requests.Session(impersonate="chrome120")
@@ -90,19 +88,17 @@ def get_cf_cookies(url: str) -> dict:
                     "AppleWebKit/537.36 (KHTML, like Gecko) "
                     "Chrome/120.0.0.0 Safari/537.36"
                 ),
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                 "Accept-Language": "en-US,en;q=0.9",
                 "Accept-Encoding": "gzip, deflate, br",
-                "Referer": "https://hanime.tv/",
+                "Referer":         "https://hanime.tv/",
             },
             allow_redirects=True,
         )
-        # Pull cookies from the session jar (includes all redirect hops)
         cookies = dict(session.cookies)
         log("INFO", f"curl_cffi: status={resp.status_code} cookies={list(cookies.keys())}")
 
         if not cookies:
-            # Fallback: manually parse Set-Cookie from response history
             for r in list(resp.history) + [resp]:
                 for h_key, h_val in r.headers.items():
                     if h_key.lower() == "set-cookie":
@@ -119,6 +115,8 @@ def get_cf_cookies(url: str) -> dict:
         log("WARN", f"curl_cffi failed: {e}")
         return {}
 
+
+# ─── DRIVER ───────────────────────────────────────────────────────────────────
 
 def build_driver():
     options = uc.ChromeOptions()
@@ -152,10 +150,10 @@ def inject_cf_cookies(driver, cookies: dict) -> None:
     for name, value in cookies.items():
         try:
             driver.add_cookie({
-                "name": name,
-                "value": value,
+                "name":   name,
+                "value":  value,
                 "domain": ".hanime.tv",
-                "path": "/",
+                "path":   "/",
             })
             injected += 1
         except Exception as e:
@@ -163,17 +161,19 @@ def inject_cf_cookies(driver, cookies: dict) -> None:
     log("INFO", f"Injected {injected}/{len(cookies)} CF cookies into Selenium")
 
 
-# ─── NETWORK INTERCEPTION (injected before page load via CDP) ─────────────────
-# This intercepts BOTH:
-#   - Outgoing request URLs (to catch m3u8/mp4 endpoints before response)
-#   - Incoming response bodies (to catch CDN URLs the backend sends back)
+# ─── NETWORK INTERCEPTOR (injected via CDP before any page JS runs) ───────────
+#
+# Populates two arrays in every window context (main page + all iframes):
+#   window.__cdn_urls    — METHOD 1: direct CDN request URLs (fires AFTER play click)
+#   window.__cdn_backend — METHOD 2: CDN URLs found inside API response bodies
+#                          (fires on page load AND again after play click)
 
 NETWORK_INTERCEPT_JS = r"""
 (function() {
     if (window.__cdn_urls_init) return;
     window.__cdn_urls_init = true;
-    window.__cdn_urls     = [];   // METHOD 1: network tab (request URLs)
-    window.__cdn_backend  = [];   // METHOD 2: backend response body
+    window.__cdn_urls    = [];
+    window.__cdn_backend = [];
 
     function isVideoUrl(url) {
         return /\.(m3u8|mp4|ts|m4v|mkv|webm)(\?|#|$)/i.test(url) || /\/m3u8s\//i.test(url);
@@ -183,21 +183,19 @@ NETWORK_INTERCEPT_JS = r"""
         return ct.includes('video') || ct.includes('mpegurl') || ct.includes('octet-stream');
     }
 
-    // Extract all CDN video URLs from a block of text (response body / JSON)
-    // Uses a generous pattern — stops at whitespace or unbalanced quote only
+    // Scan a block of text for embedded CDN video URLs
     function extractCdnUrls(text) {
         var found = [];
-        // Match full URL including query string, stop at whitespace / quote / angle bracket
         var re = /https?:\/\/[^\s"'<>\\]+/gi;
         var m;
         while ((m = re.exec(text)) !== null) {
-            var u = m[0].replace(/[.,;)\]]+$/, ''); // strip trailing punctuation
+            var u = m[0].replace(/[.,;)\]]+$/, '');
             if (isVideoUrl(u)) found.push(u);
         }
         return found;
     }
 
-    // ── METHOD 1: Intercept outgoing request URLs ─────────────────────────
+    // ── XHR interception ─────────────────────────────────────────────────────
     var _origOpen = XMLHttpRequest.prototype.open;
     XMLHttpRequest.prototype.open = function(method, url) {
         this.__req_url = url || '';
@@ -206,47 +204,58 @@ NETWORK_INTERCEPT_JS = r"""
 
     var _origSend = XMLHttpRequest.prototype.send;
     XMLHttpRequest.prototype.send = function(body) {
-        var xhr  = this;
-        var url  = xhr.__req_url || '';
+        var xhr = this;
+        var url = xhr.__req_url || '';
+
+        // Method 1: capture direct CDN request URLs
         if (isVideoUrl(url)) {
             window.__cdn_urls.push({ url: url, via: 'xhr-req' });
         }
+
         xhr.addEventListener('readystatechange', function() {
             if (xhr.readyState === 4 && xhr.status >= 200 && xhr.status < 300) {
                 var ct = xhr.getResponseHeader('Content-Type') || '';
+
+                // Method 1: video content-type response URL
                 if (isVideoCt(ct) && url) {
                     window.__cdn_urls.push({ url: url, via: 'xhr-resp-ct', ct: ct });
                 }
-                // Method 2: scan response text for CDN URLs
+
+                // Method 2: scan response body for embedded CDN URLs
                 try {
-                    var matches = extractCdnUrls(xhr.responseText || '');
-                    matches.forEach(function(u) {
+                    extractCdnUrls(xhr.responseText || '').forEach(function(u) {
                         window.__cdn_backend.push({ url: u, via: 'xhr-body', src_url: url });
                     });
                 } catch(e) {}
             }
         });
+
         return _origSend.apply(this, arguments);
     };
 
-    // ── fetch interception ────────────────────────────────────────────────
+    // ── fetch interception ────────────────────────────────────────────────────
     var _origFetch = window.fetch;
     window.fetch = function(input, init) {
         var url = typeof input === 'string' ? input : (input && input.url) || '';
+
+        // Method 1: capture direct CDN request URLs
         if (isVideoUrl(url)) {
             window.__cdn_urls.push({ url: url, via: 'fetch-req' });
         }
+
         return _origFetch.apply(this, arguments).then(function(resp) {
             try {
                 var ct = resp.headers.get('Content-Type') || '';
+
+                // Method 1: video content-type response URL
                 if (resp.ok && isVideoCt(ct) && url) {
                     window.__cdn_urls.push({ url: url, via: 'fetch-resp-ct', ct: ct });
                 }
-                // Method 2: scan response body
+
+                // Method 2: scan response body for embedded CDN URLs
                 if (resp.ok) {
                     resp.clone().text().then(function(text) {
-                        var matches = extractCdnUrls(text);
-                        matches.forEach(function(u) {
+                        extractCdnUrls(text).forEach(function(u) {
                             window.__cdn_backend.push({ url: u, via: 'fetch-body', src_url: url });
                         });
                     }).catch(function(){});
@@ -259,10 +268,43 @@ NETWORK_INTERCEPT_JS = r"""
 """
 
 
-# ─── METHOD 1: Check Network Tab (outgoing request URLs) ─────────────────────
+# ─── METHOD 2: Backend Response Body ─────────────────────────────────────────
 
-def method1_network_tab(driver, in_iframe: bool = False) -> str | None:
-    """Read __cdn_urls — populated from outgoing XHR/fetch request URLs."""
+def method2_backend_response(driver, retries: int = 4, delay: float = 1.0) -> str | None:
+    """
+    Read window.__cdn_backend — CDN URLs extracted from API response bodies.
+    Retries because fetch().then(text()) resolves asynchronously.
+    Called both:
+      - Early (right after page load — Vue fetches /api/v8/guest/videos/{id}/ on mount)
+      - Post-click (in case the API re-fetches after play is triggered)
+    """
+    for attempt in range(retries):
+        try:
+            raw = driver.execute_script("return window.__cdn_backend || [];")
+            for item in (raw or []):
+                url = item.get("url", "") if isinstance(item, dict) else str(item)
+                via = item.get("via", "?") if isinstance(item, dict) else "?"
+                src = item.get("src_url", "") if isinstance(item, dict) else ""
+                log("INFO", f"M2 [{via}] from={src[:60]}: {url[:100]}")
+                if is_real_video_url(url):
+                    log("HIT", f"Method2 backend response: {url[:120]}")
+                    return url
+            if attempt < retries - 1:
+                log("INFO", f"M2 no hit yet, retry {attempt + 1}/{retries - 1}...")
+                time.sleep(delay)
+        except Exception as e:
+            log("WARN", f"Method2 error: {e}")
+    return None
+
+
+# ─── METHOD 1: Network Tab (direct CDN request URLs) ─────────────────────────
+
+def method1_network_tab(driver) -> str | None:
+    """
+    Read window.__cdn_urls — populated when the player directly requests
+    a CDN video URL (m3u8/mp4). Only fires AFTER play is clicked because
+    the player only starts streaming once the user triggers playback.
+    """
     try:
         raw = driver.execute_script("return window.__cdn_urls || [];")
         for item in (raw or []):
@@ -277,39 +319,13 @@ def method1_network_tab(driver, in_iframe: bool = False) -> str | None:
     return None
 
 
-# ─── METHOD 2: Backend Response Body ─────────────────────────────────────────
-
-def method2_backend_response(driver, retries: int = 4, delay: float = 1.0) -> str | None:
-    """
-    Read __cdn_backend — CDN URLs extracted from XHR/fetch response bodies.
-    Retries a few times because the fetch().then(text()) promise resolves async.
-    """
-    for attempt in range(retries):
-        try:
-            raw = driver.execute_script("return window.__cdn_backend || [];")
-            for item in (raw or []):
-                url = item.get("url", "") if isinstance(item, dict) else str(item)
-                via = item.get("via", "?") if isinstance(item, dict) else "?"
-                src = item.get("src_url", "") if isinstance(item, dict) else ""
-                log("INFO", f"M2 backend [{via}] from={src[:60]}: {url[:100]}")
-                if is_real_video_url(url):
-                    log("HIT", f"Method2 backend response: {url[:120]}")
-                    return url
-            if attempt < retries - 1:
-                log("INFO", f"M2 no hit yet, retry {attempt+1}/{retries-1}...")
-                time.sleep(delay)
-        except Exception as e:
-            log("WARN", f"Method2 error: {e}")
-    return None
-
-
-# ─── METHOD 3: Scan Player iFrame ────────────────────────────────────────────
+# ─── METHOD 3: Player iFrame Scan ────────────────────────────────────────────
 
 def method3_iframe_scan(driver) -> str | None:
     """
-    Switch into the real omni-player iframe (not ad iframes) and:
-      a) Check its own __cdn_urls / __cdn_backend (tracker injected via CDP)
-      b) Decode CDN URL from the iframe's own src parameter
+    Find the real omni-player iframe and:
+      3a) Decode any CDN URL embedded in the iframe src parameters
+      3b) Switch into iframe JS context and read its own __cdn_backend / __cdn_urls
     """
     try:
         iframes = driver.find_elements(By.TAG_NAME, "iframe")
@@ -318,40 +334,30 @@ def method3_iframe_scan(driver) -> str | None:
                 continue
 
             src = frame.get_attribute("src") or ""
-            log("INFO", f"M3 — real player iframe src: {src[:150]}")
+            log("INFO", f"M3 — player iframe src: {src[:150]}")
 
-            # 3a: Decode CDN URL from iframe src parameters
+            # 3a: CDN URL sometimes URL-encoded in iframe src params
             decoded = unquote(src)
-            candidates = re.findall(r'https?://[^\s,&#\'"<>]+', decoded)
-            for url in candidates:
+            for url in re.findall(r'https?://[^\s,&#\'"<>]+', decoded):
                 url = url.rstrip(".,;)")
                 if is_real_video_url(url):
                     log("HIT", f"Method3a iframe src decode: {url[:120]}")
                     return url
 
-            # 3b: Switch into iframe and check its intercepted network data
+            # 3b: Switch into iframe and read its intercepted network data
             try:
                 driver.switch_to.frame(frame)
                 log("INFO", "M3 — switched into player iframe")
 
-                # Check network tab data inside iframe
-                raw1 = driver.execute_script("return window.__cdn_urls || [];")
-                for item in (raw1 or []):
-                    url = item.get("url", "") if isinstance(item, dict) else str(item)
-                    if is_real_video_url(url):
-                        log("HIT", f"Method3b iframe __cdn_urls: {url[:120]}")
-                        driver.switch_to.default_content()
-                        return url
-
-                # Check backend response data inside iframe
-                raw2 = driver.execute_script("return window.__cdn_backend || [];")
-                for item in (raw2 or []):
-                    url = item.get("url", "") if isinstance(item, dict) else str(item)
-                    if is_real_video_url(url):
-                        log("HIT", f"Method3b iframe __cdn_backend: {url[:120]}")
-                        driver.switch_to.default_content()
-                        return url
-
+                # Check backend response data first, then direct CDN requests
+                for arr_name in ("__cdn_backend", "__cdn_urls"):
+                    raw = driver.execute_script(f"return window.{arr_name} || [];")
+                    for item in (raw or []):
+                        url = item.get("url", "") if isinstance(item, dict) else str(item)
+                        if is_real_video_url(url):
+                            log("HIT", f"Method3b iframe {arr_name}: {url[:120]}")
+                            driver.switch_to.default_content()
+                            return url
             finally:
                 try:
                     driver.switch_to.default_content()
@@ -380,10 +386,10 @@ def load_cookies(driver, cookies_file: str) -> bool:
         for c in cookies:
             try:
                 clean = {
-                    "name": c["name"],
-                    "value": c["value"],
+                    "name":   c["name"],
+                    "value":  c["value"],
                     "domain": c.get("domain", ".hanime.tv"),
-                    "path": c.get("path", "/"),
+                    "path":   c.get("path", "/"),
                 }
                 if "secure" in c:
                     clean["secure"] = c["secure"]
@@ -392,7 +398,7 @@ def load_cookies(driver, cookies_file: str) -> bool:
                 driver.add_cookie(clean)
                 loaded += 1
             except Exception as e:
-                log("WARN", f"Skipped cookie {c.get('name','?')}: {e}")
+                log("WARN", f"Skipped cookie {c.get('name', '?')}: {e}")
         log("INFO", f"Loaded {loaded}/{len(cookies)} login cookies")
         return loaded > 0
     except Exception as e:
@@ -404,11 +410,13 @@ def load_cookies(driver, cookies_file: str) -> bool:
 
 def remove_ads(driver) -> None:
     """
-    Nuke all known ad elements from the DOM before interacting with the player.
-    This prevents accidental clicks on ad overlays and frees memory.
+    Nuke all known ad elements from the DOM.
+    Called TWICE:
+      1. Before play click — clears existing ads
+      2. After play click  — removes invisible overlay ads that inject on play
+    A MutationObserver is also installed to block future ad injections.
     """
     driver.execute_script("""
-        // Ad selectors to obliterate
         var adSelectors = [
             'iframe[src*="googlesyndication"]',
             'iframe[src*="doubleclick"]',
@@ -434,65 +442,92 @@ def remove_ads(driver) -> None:
             } catch(e) {}
         });
 
-        // Block new ads from being inserted
-        try {
-            var observer = new MutationObserver(function(mutations) {
-                mutations.forEach(function(m) {
-                    m.addedNodes.forEach(function(node) {
-                        if (!node.tagName) return;
-                        var src = (node.src || node.getAttribute && node.getAttribute('src') || '').toLowerCase();
-                        var cls = (node.className || '').toLowerCase();
-                        if (src.includes('googlesyndication') || src.includes('doubleclick') ||
-                            src.includes('adnxs') || src.includes('adservice') ||
-                            cls.includes('banner-ad') && !src.includes('omni-player') ||
-                            cls.includes('ad-slot') || cls.includes('ad-unit')) {
-                            try { node.remove(); } catch(e) {}
-                        }
+        // Install MutationObserver once to block future ad injections
+        if (!window.__adObserverActive) {
+            window.__adObserverActive = true;
+            try {
+                new MutationObserver(function(mutations) {
+                    mutations.forEach(function(m) {
+                        m.addedNodes.forEach(function(node) {
+                            if (!node.tagName) return;
+                            var src = (node.src || (node.getAttribute && node.getAttribute('src')) || '').toLowerCase();
+                            var cls = (node.className || '').toLowerCase();
+                            // Never remove the real omni-player iframe
+                            if (src.includes('omni-player')) return;
+                            if (src.includes('googlesyndication') || src.includes('doubleclick') ||
+                                src.includes('adnxs') || src.includes('adservice') ||
+                                cls.includes('ad-slot') || cls.includes('ad-unit') ||
+                                cls.includes('hvp-adslot')) {
+                                try { node.remove(); } catch(e) {}
+                            }
+                        });
                     });
-                });
-            });
-            observer.observe(document.body, { childList: true, subtree: true });
-        } catch(e) {}
+                }).observe(document.body, { childList: true, subtree: true });
+            } catch(e) {}
+        }
 
         console.log('[AdKill] removed', removed, 'ad elements');
     """)
     log("INFO", "Ads removed from DOM")
 
 
-
+# ─── PLAY BUTTON ──────────────────────────────────────────────────────────────
 
 def find_and_click_play(driver) -> bool:
     """
-    Find the real play button (not inside an ad iframe) and click it.
-    Tries CSS selectors scoped to the main player container.
+    Click the play button inside .htv-video-player.
+    Tries multiple strategies to properly trigger Vue's play handler.
     """
+    # Strategy 1: specific play button child selectors
     PLAY_SELECTORS = [
         ".htv-video-player .play-btn",
-        ".htv-video-player",
+        ".htv-video-player .vjs-big-play-button",
+        ".htv-video-player .play-button",
+        ".htv-video-player video",
         "div.play-btn",
         ".play-btn",
     ]
     for sel in PLAY_SELECTORS:
         try:
-            btn = WebDriverWait(driver, 4).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, sel))
-            )
-            # Make sure we're not accidentally clicking inside an ad iframe
+            btn = driver.find_element(By.CSS_SELECTOR, sel)
+            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
             driver.execute_script("arguments[0].click();", btn)
             log("HIT", f"Clicked play: {sel!r}")
             return True
         except Exception:
             continue
+
+    # Strategy 2: dispatch a real MouseEvent on the player container (Vue-friendly)
+    try:
+        player = driver.find_element(By.CSS_SELECTOR, ".htv-video-player")
+        driver.execute_script("""
+            arguments[0].dispatchEvent(new MouseEvent('click', {
+                bubbles: true, cancelable: true, view: window
+            }));
+        """, player)
+        log("HIT", "Clicked play: dispatched MouseEvent on .htv-video-player")
+        return True
+    except Exception:
+        pass
+
+    # Strategy 3: call video.play() directly on the DOM element
+    try:
+        driver.execute_script("""
+            var v = document.querySelector('video');
+            if (v) { v.play(); }
+        """)
+        log("HIT", "Clicked play: called video.play() directly")
+        return True
+    except Exception:
+        pass
+
     return False
 
 
-# ─── WAIT FOR REAL PLAYER IFRAME ──────────────────────────────────────────────
+# ─── WAIT FOR PLAYER IFRAME ───────────────────────────────────────────────────
 
-def wait_for_player_iframe(driver, timeout: int = 15) -> bool:
-    """
-    Wait for the real omni-player iframe to appear (ignoring ad iframes).
-    Returns True if found within timeout.
-    """
+def wait_for_player_iframe(driver, timeout: int = 12) -> bool:
+    """Wait for the real omni-player iframe to appear in the DOM."""
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
@@ -511,49 +546,42 @@ def wait_for_player_iframe(driver, timeout: int = 15) -> bool:
 
 def scrape_video_url(page_url: str) -> dict:
     log("INFO", f"Scraping: {page_url}")
-    result = {"title": "Unknown", "stream_url": None, "error": None}
-    driver = build_driver()
+    result  = {"title": "Unknown", "stream_url": None, "error": None}
+    driver  = build_driver()
 
     try:
-        # Inject network interceptor into ALL frames before any page JS runs
+        # Inject network interceptor into every frame before any JS runs
         driver.execute_cdp_cmd(
             "Page.addScriptToEvaluateOnNewDocument",
             {"source": NETWORK_INTERCEPT_JS}
         )
         log("INFO", "Network interceptor injected via CDP")
 
-        # ── STEP 0: curl_cffi CF bypass ───────────────────────────────────────
-        # curl_cffi impersonates Chrome120 TLS fingerprint (JA3/JA4).
-        # Cloudflare checks this BEFORE any JS challenge.
-        # We grab cf_clearance + __cf_bm from curl_cffi and inject into Selenium.
+        # ── CF bypass ─────────────────────────────────────────────────────────
         cf_cookies = get_cf_cookies(page_url)
 
-        # Navigate to hanime.tv so we can set cookies for its domain
         driver.get("https://hanime.tv")
         WebDriverWait(driver, 10).until(
             lambda d: d.execute_script("return document.readyState") == "complete"
         )
 
-        # Inject CF clearance cookies
         inject_cf_cookies(driver, cf_cookies)
-
-        # Inject login cookies if available
         load_cookies(driver, COOKIES_FILE)
 
-        # Re-register tracker for any new documents (e.g., after page reload)
+        # Re-register interceptor for subsequent navigations
         driver.execute_cdp_cmd(
             "Page.addScriptToEvaluateOnNewDocument",
             {"source": NETWORK_INTERCEPT_JS}
         )
 
-        # ── STEP 1: Navigate to video page ────────────────────────────────────
+        # ── Navigate to video page ─────────────────────────────────────────────
         driver.get(page_url)
         WebDriverWait(driver, 20).until(
             lambda d: d.execute_script("return document.readyState") in ("interactive", "complete")
         )
         log("INFO", f"Page loaded: {driver.title!r}")
 
-        # Title
+        # Extract title
         try:
             el = WebDriverWait(driver, 5).until(
                 EC.presence_of_element_located(
@@ -567,49 +595,75 @@ def scrape_video_url(page_url: str) -> dict:
             r'\s*[-|]\s*hanime\.tv.*$', '', result["title"], flags=re.IGNORECASE
         ).strip()
 
-        # Scroll a bit so lazy-loaded player renders
         driver.execute_script("window.scrollBy(0, window.innerHeight * 0.3);")
-        time.sleep(1)
 
-        # ── STEP 2: Remove ads, then wait for player container and click play ──
-        log("INFO", "Waiting for player container...")
-        try:
-            WebDriverWait(driver, 10).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, ".htv-video-player"))
-            )
-            # Nuke ad elements before interacting with the player
-            remove_ads(driver)
-            time.sleep(0.5)
-
-            log("INFO", "Player container found — clicking play...")
-            clicked = find_and_click_play(driver)
-            if not clicked:
-                log("WARN", "Could not click any play button")
-        except Exception as e:
-            log("WARN", f"Player container not found: {e}")
-
-        # Give the player a moment to fire its initial requests after click
+        # ══════════════════════════════════════════════════════════════════════
+        # EARLY Method 2 — runs before play click
+        # Vue calls /api/v8/guest/videos/{id}/ on page mount.
+        # The JSON response contains all CDN stream URLs.
+        # If we catch it here, we skip play click entirely.
+        # ══════════════════════════════════════════════════════════════════════
+        log("INFO", "Early Method2: checking page-load API response...")
         time.sleep(2)
-        cdn_url = None
-        method_used = None
+        cdn_url     = method2_backend_response(driver, retries=3, delay=0.8)
+        method_used = "Method2 early (page-load API response)" if cdn_url else None
 
-        # ── STEP 3: METHOD 1 — Network tab (outgoing request URLs) ───────────
-        log("INFO", "Method1: checking network tab for direct CDN request URLs...")
-        cdn_url = method1_network_tab(driver)
-        if cdn_url:
-            method_used = "Method1 (network tab)"
-
-        # ── STEP 4: METHOD 2 — Backend response body ──────────────────────────
         if not cdn_url:
-            log("INFO", "Method2: checking backend response bodies for CDN URLs...")
-            cdn_url = method2_backend_response(driver)
+            # ── Remove ads BEFORE play click ──────────────────────────────────
+            log("INFO", "Waiting for player container...")
+            try:
+                WebDriverWait(driver, 10).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, ".htv-video-player"))
+                )
+                remove_ads(driver)
+                time.sleep(0.5)
+
+                # ── Click play ────────────────────────────────────────────────
+                log("INFO", "Player container found — clicking play...")
+                clicked = find_and_click_play(driver)
+                if not clicked:
+                    log("WARN", "Could not click any play button")
+
+                # ── Remove ads AFTER play click ───────────────────────────────
+                # Invisible overlay ads inject into the DOM right after play.
+                # Remove them so they can't steal focus or intercept events.
+                time.sleep(1)
+                remove_ads(driver)
+
+            except Exception as e:
+                log("WARN", f"Player container not found: {e}")
+
+            # Give player time to fire post-click network requests
+            time.sleep(2)
+
+            # ══════════════════════════════════════════════════════════════════
+            # Method 2 POST-CLICK — API may re-fetch after play is triggered.
+            # Ads are now cleared so no interference with the response capture.
+            # ══════════════════════════════════════════════════════════════════
+            log("INFO", "Method2: checking backend response bodies (post-click)...")
+            cdn_url = method2_backend_response(driver, retries=4, delay=1.0)
             if cdn_url:
-                method_used = "Method2 (backend response body)"
+                method_used = "Method2 (post-click API response)"
 
-        # ── STEP 5: METHOD 3 — Player iframe scan ─────────────────────────────
         if not cdn_url:
+            # ══════════════════════════════════════════════════════════════════
+            # Method 1 — direct CDN request URLs.
+            # Only fires AFTER play click because the player only starts
+            # requesting stream segments once playback is triggered.
+            # ══════════════════════════════════════════════════════════════════
+            log("INFO", "Method1: checking network tab for direct CDN request URLs...")
+            cdn_url = method1_network_tab(driver)
+            if cdn_url:
+                method_used = "Method1 (network tab)"
+
+        if not cdn_url:
+            # ══════════════════════════════════════════════════════════════════
+            # Method 3 — iframe fallback.
+            # Scans the omni-player iframe src params and its own JS context.
+            # Last resort only.
+            # ══════════════════════════════════════════════════════════════════
             log("INFO", "Method3: waiting for player iframe then scanning...")
-            found = wait_for_player_iframe(driver, timeout=12)
+            found = wait_for_player_iframe(driver, timeout=10)
             if not found:
                 log("WARN", "Real player iframe did not appear")
             else:
@@ -642,7 +696,7 @@ def scrape_video_url(page_url: str) -> dict:
 async def download_with_ytdlp(
     cdn_url: str, title: str, session_id: str, status_msg: Message
 ) -> str | None:
-    safe_title = re.sub(r'[^\w\s-]', '', title)[:60].strip() or "video"
+    safe_title  = re.sub(r'[^\w\s-]', '', title)[:60].strip() or "video"
     session_dir = os.path.join(DOWNLOAD_DIR, session_id)
     os.makedirs(session_dir, exist_ok=True)
     output_template = os.path.join(session_dir, f"{safe_title}.%(ext)s")
@@ -703,7 +757,9 @@ async def start_cmd(_, message: Message):
 async def dl_cmd(client: Client, message: Message):
     args = message.text.split(maxsplit=1)
     if len(args) < 2:
-        await message.reply_text("❌ Usage: <code>/dl &lt;hanime.tv URL&gt;</code>", parse_mode=PM)
+        await message.reply_text(
+            "❌ Usage: <code>/dl &lt;hanime.tv URL&gt;</code>", parse_mode=PM
+        )
         return
 
     url = args[1].strip()
@@ -726,14 +782,18 @@ async def dl_cmd(client: Client, message: Message):
         return
 
     if data.get("error"):
-        await status.edit_text(f"❌ Error:\n<code>{html_esc(data['error'])}</code>", parse_mode=PM)
+        await status.edit_text(
+            f"❌ Error:\n<code>{html_esc(data['error'])}</code>", parse_mode=PM
+        )
         return
 
     cdn_url = data["stream_url"]
     title   = data["title"]
 
     if not cdn_url:
-        await status.edit_text("❌ No CDN URL found. Login may be required.", parse_mode=PM)
+        await status.edit_text(
+            "❌ No CDN URL found. Login may be required.", parse_mode=PM
+        )
         return
 
     await status.edit_text(
@@ -742,7 +802,7 @@ async def dl_cmd(client: Client, message: Message):
     )
 
     session_id = str(uuid.uuid4())
-    file_path = await download_with_ytdlp(cdn_url, title, session_id, status)
+    file_path  = await download_with_ytdlp(cdn_url, title, session_id, status)
 
     if not file_path or not os.path.exists(file_path):
         await status.edit_text(
@@ -772,7 +832,9 @@ async def dl_cmd(client: Client, message: Message):
         )
         await status.delete()
     except Exception as e:
-        await status.edit_text(f"❌ Upload failed:\n<code>{html_esc(e)}</code>", parse_mode=PM)
+        await status.edit_text(
+            f"❌ Upload failed:\n<code>{html_esc(e)}</code>", parse_mode=PM
+        )
     finally:
         try:
             import shutil
