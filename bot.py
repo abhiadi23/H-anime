@@ -45,10 +45,6 @@ VIDEO_EXT = re.compile(r'\.(m3u8|mp4|mkv|ts|m4v|webm|m3u)(\?|#|$)|/m3u8s/', re.I
 # The real omni-player iframe domain
 OMNI_PLAYER = re.compile(r'hanime\.tv/omni-player', re.IGNORECASE)
 
-# Ad iframe class signatures — never touch these
-AD_CLASSES = re.compile(r'(ad-content|banner-ad|vertical-ad|hvp-panel)', re.IGNORECASE)
-
-
 def is_real_video_url(url: str) -> bool:
     if not url or not url.startswith("http"):
         return False
@@ -62,16 +58,10 @@ def is_real_video_url(url: str) -> bool:
 
 
 def is_real_player_iframe(frame) -> bool:
-    """Return True only for the actual omni-player iframe, not ad iframes."""
+    """Return True for any omni-player iframe regardless of CSS classes."""
     try:
         src = frame.get_attribute("src") or ""
-        cls = frame.get_attribute("class") or ""
-        # Must be the omni-player
         if not OMNI_PLAYER.search(src):
-            return False
-        # Must NOT be an ad frame
-        if AD_CLASSES.search(cls):
-            log("INFO", f"Skipping ad iframe: class={cls!r} src={src[:80]}")
             return False
         return True
     except Exception:
@@ -289,20 +279,27 @@ def method1_network_tab(driver, in_iframe: bool = False) -> str | None:
 
 # ─── METHOD 2: Backend Response Body ─────────────────────────────────────────
 
-def method2_backend_response(driver) -> str | None:
-    """Read __cdn_backend — CDN URLs extracted from XHR/fetch response bodies."""
-    try:
-        raw = driver.execute_script("return window.__cdn_backend || [];")
-        for item in (raw or []):
-            url = item.get("url", "") if isinstance(item, dict) else str(item)
-            via = item.get("via", "?") if isinstance(item, dict) else "?"
-            src = item.get("src_url", "") if isinstance(item, dict) else ""
-            log("INFO", f"M2 backend [{via}] from={src[:60]}: {url[:100]}")
-            if is_real_video_url(url):
-                log("HIT", f"Method2 backend response: {url[:120]}")
-                return url
-    except Exception as e:
-        log("WARN", f"Method2 error: {e}")
+def method2_backend_response(driver, retries: int = 4, delay: float = 1.0) -> str | None:
+    """
+    Read __cdn_backend — CDN URLs extracted from XHR/fetch response bodies.
+    Retries a few times because the fetch().then(text()) promise resolves async.
+    """
+    for attempt in range(retries):
+        try:
+            raw = driver.execute_script("return window.__cdn_backend || [];")
+            for item in (raw or []):
+                url = item.get("url", "") if isinstance(item, dict) else str(item)
+                via = item.get("via", "?") if isinstance(item, dict) else "?"
+                src = item.get("src_url", "") if isinstance(item, dict) else ""
+                log("INFO", f"M2 backend [{via}] from={src[:60]}: {url[:100]}")
+                if is_real_video_url(url):
+                    log("HIT", f"Method2 backend response: {url[:120]}")
+                    return url
+            if attempt < retries - 1:
+                log("INFO", f"M2 no hit yet, retry {attempt+1}/{retries-1}...")
+                time.sleep(delay)
+        except Exception as e:
+            log("WARN", f"Method2 error: {e}")
     return None
 
 
@@ -403,7 +400,66 @@ def load_cookies(driver, cookies_file: str) -> bool:
         return False
 
 
-# ─── PLAY BUTTON ──────────────────────────────────────────────────────────────
+# ─── AD REMOVAL ───────────────────────────────────────────────────────────────
+
+def remove_ads(driver) -> None:
+    """
+    Nuke all known ad elements from the DOM before interacting with the player.
+    This prevents accidental clicks on ad overlays and frees memory.
+    """
+    driver.execute_script("""
+        // Ad selectors to obliterate
+        var adSelectors = [
+            'iframe[src*="googlesyndication"]',
+            'iframe[src*="doubleclick"]',
+            'iframe[src*="adservice"]',
+            'iframe[src*="adsystem"]',
+            'iframe[src*="advertising"]',
+            'iframe[src*="adnxs"]',
+            'iframe[src*="ad."]',
+            '.ad-container', '.ad-wrapper', '.ad-slot',
+            '.banner-ad', '.vertical-ad', '.hvp-adslot',
+            '#ad-container', '#ad-banner', '#adsense',
+            '[id*="google_ads"]', '[class*="google-ad"]',
+            '[class*="dfp-ad"]', '[class*="ad-unit"]',
+            'ins.adsbygoogle',
+        ];
+        var removed = 0;
+        adSelectors.forEach(function(sel) {
+            try {
+                document.querySelectorAll(sel).forEach(function(el) {
+                    el.remove();
+                    removed++;
+                });
+            } catch(e) {}
+        });
+
+        // Block new ads from being inserted
+        try {
+            var observer = new MutationObserver(function(mutations) {
+                mutations.forEach(function(m) {
+                    m.addedNodes.forEach(function(node) {
+                        if (!node.tagName) return;
+                        var src = (node.src || node.getAttribute && node.getAttribute('src') || '').toLowerCase();
+                        var cls = (node.className || '').toLowerCase();
+                        if (src.includes('googlesyndication') || src.includes('doubleclick') ||
+                            src.includes('adnxs') || src.includes('adservice') ||
+                            cls.includes('banner-ad') && !src.includes('omni-player') ||
+                            cls.includes('ad-slot') || cls.includes('ad-unit')) {
+                            try { node.remove(); } catch(e) {}
+                        }
+                    });
+                });
+            });
+            observer.observe(document.body, { childList: true, subtree: true });
+        } catch(e) {}
+
+        console.log('[AdKill] removed', removed, 'ad elements');
+    """)
+    log("INFO", "Ads removed from DOM")
+
+
+
 
 def find_and_click_play(driver) -> bool:
     """
@@ -515,12 +571,16 @@ def scrape_video_url(page_url: str) -> dict:
         driver.execute_script("window.scrollBy(0, window.innerHeight * 0.3);")
         time.sleep(1)
 
-        # ── STEP 2: Wait for player container and click play ──────────────────
+        # ── STEP 2: Remove ads, then wait for player container and click play ──
         log("INFO", "Waiting for player container...")
         try:
             WebDriverWait(driver, 10).until(
                 EC.presence_of_element_located((By.CSS_SELECTOR, ".htv-video-player"))
             )
+            # Nuke ad elements before interacting with the player
+            remove_ads(driver)
+            time.sleep(0.5)
+
             log("INFO", "Player container found — clicking play...")
             clicked = find_and_click_play(driver)
             if not clicked:
