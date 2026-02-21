@@ -5,6 +5,7 @@ import json
 import time
 import glob
 import uuid
+from urllib.parse import unquote
 from config import *
 from pyrogram import Client, filters, enums
 from pyrogram.types import Message
@@ -32,26 +33,12 @@ def log(level: str, msg: str) -> None:
 
 # ─── URL VALIDATION ───────────────────────────────────────────────────────────
 
-AD_BLACKLIST = re.compile(
-    r'(blankmp4s\.pages\.dev|adtng\.com|adnxs\.com|adsrvr\.org|advertising\.com|'
-    r'ads\.yahoo\.com|moatads\.com|amazon-adsystem\.com|exoclick\.com|'
-    r'trafficjunky\.net|traffichaus\.com|juicyads\.com|plugrush\.com|'
-    r'tsyndicate\.com|etahub\.com|realsrv\.com|doubleclick\.net|'
-    r'googletagmanager\.com|google-analytics\.com|creatives\.|ad-delivery\.|'
-    r'ht-cdn2\.|adtng\.|adnxs\.)',
-    re.IGNORECASE
-)
-
 HANIME_CDN = re.compile(
     r'(hwcdn\.net|hanime\.tv|videodelivery\.net|mux\.com|'
-    r'akamaized\.net|cloudfront\.net|fastly\.net|b-cdn\.net|'
-    r'hanime-cdn\.com)',
+    r'akamaized\.net|cloudfront\.net|fastly\.net|b-cdn\.net|hanime-cdn\.com)',
     re.IGNORECASE
 )
-
 VIDEO_EXT = re.compile(r'\.(m3u8|mp4|mkv|ts|m4v|webm)(\?|#|$)', re.IGNORECASE)
-
-# Only trust iframes from hanime's own player domain
 PLAYER_DOMAIN = re.compile(r'player\.hanime\.tv', re.IGNORECASE)
 
 
@@ -59,8 +46,6 @@ def is_real_video_url(url: str) -> bool:
     if not url or not url.startswith("http"):
         return False
     if url.startswith("blob:"):
-        return False
-    if AD_BLACKLIST.search(url):
         return False
     if not HANIME_CDN.search(url):
         return False
@@ -82,8 +67,6 @@ def build_driver():
     options.add_argument("--ignore-certificate-errors")
     options.add_argument("--ignore-ssl-errors")
     options.add_argument("--disable-extensions")
-    options.add_argument("--disable-background-networking")
-    options.add_argument("--disable-default-apps")
     options.add_argument("--disable-sync")
     options.add_argument("--mute-audio")
     options.add_argument("--no-first-run")
@@ -91,53 +74,133 @@ def build_driver():
     return uc.Chrome(options=options)
 
 
-# ─── NETWORK TRACKER JS ───────────────────────────────────────────────────────
-# Injected into EVERY frame (including iframes) via CDP.
-# Captures XHR, fetch, and video.src assignments.
-# Stores results in window.__vid_urls on each frame's own window.
+# ─── WAY 2: XHR/FETCH RESPONSE INTERCEPTION ──────────────────────────────────
+# Injected into player iframe via CDP before page loads.
+# After play is clicked, the player sends a request to backend.
+# This catches the CDN URL from the actual response that comes back.
 
-TRACKER_JS = r"""
-if (!window.__vid_urls) window.__vid_urls = [];
+RESPONSE_TRACKER_JS = r"""
+if (!window.__cdn_urls) window.__cdn_urls = [];
 
-// 1. video.src setter
+// Intercept XHR — capture response URL when backend replies with video content
 (function() {
-    var desc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'src');
-    if (desc && desc.set) {
-        Object.defineProperty(HTMLMediaElement.prototype, 'src', {
-            set: function(val) {
-                if (val && typeof val === 'string' && val.startsWith('http'))
-                    window.__vid_urls.push({url: val, type: 'src'});
-                return desc.set.call(this, val);
-            },
-            get: desc.get, configurable: true
-        });
-    }
-})();
+    var origOpen = XMLHttpRequest.prototype.open;
+    var origSend = XMLHttpRequest.prototype.send;
 
-// 2. XHR — only capture video file requests
-(function() {
-    var orig = XMLHttpRequest.prototype.open;
     XMLHttpRequest.prototype.open = function(method, url) {
-        if (url && typeof url === 'string' &&
-            /\.(m3u8|mp4|ts|m4v|mkv)(\?|#|$)/i.test(url))
-            window.__vid_urls.push({url: url, type: 'xhr'});
-        return orig.apply(this, arguments);
+        this.__req_url = url;
+        return origOpen.apply(this, arguments);
+    };
+
+    XMLHttpRequest.prototype.send = function(body) {
+        var xhr = this;
+        xhr.addEventListener('readystatechange', function() {
+            if (xhr.readyState === 4 && xhr.status >= 200 && xhr.status < 300) {
+                var url = xhr.__req_url || '';
+                var ct  = xhr.getResponseHeader('Content-Type') || '';
+                var isVideoUrl = /\.(m3u8|mp4|ts|m4v|mkv)(\?|#|$)/i.test(url);
+                var isVideoCt  = ct.includes('video') || ct.includes('mpegurl') || ct.includes('octet-stream');
+                if (isVideoUrl || isVideoCt) {
+                    window.__cdn_urls.push({url: url, via: 'xhr', status: xhr.status, ct: ct});
+                }
+            }
+        });
+        return origSend.apply(this, arguments);
     };
 })();
 
-// 3. fetch — only capture video file requests
+// Intercept fetch — capture response URL when backend replies with video content
 (function() {
-    var orig = window.fetch;
+    var origFetch = window.fetch;
     window.fetch = function(input, init) {
-        try {
-            var url = typeof input === 'string' ? input : (input && input.url) || '';
-            if (url && /\.(m3u8|mp4|ts|m4v|mkv)(\?|#|$)/i.test(url))
-                window.__vid_urls.push({url: url, type: 'fetch'});
-        } catch(e) {}
-        return orig.apply(this, arguments);
+        var url = typeof input === 'string' ? input : (input && input.url) || '';
+        return origFetch.apply(this, arguments).then(function(resp) {
+            try {
+                var ct = resp.headers.get('Content-Type') || '';
+                var isVideoUrl = /\.(m3u8|mp4|ts|m4v|mkv)(\?|#|$)/i.test(url);
+                var isVideoCt  = ct.includes('video') || ct.includes('mpegurl') || ct.includes('octet-stream');
+                if (resp.ok && (isVideoUrl || isVideoCt)) {
+                    window.__cdn_urls.push({url: url, via: 'fetch', status: resp.status, ct: ct});
+                }
+            } catch(e) {}
+            return resp;
+        });
     };
 })();
 """
+
+
+# ─── WAY 1: DECODE CDN URL FROM PLAYER IFRAME SRC ────────────────────────────
+# From logs: iframe src = https://player.hanime.tv/?&#v2,3014,slug,https%3A%2F%2F...
+# The CDN URL is URL-encoded inside the iframe src as the last parameter.
+# Decode it and extract directly — works immediately after iframe appears,
+# no need to wait for any network request.
+
+def way1_extract_from_iframe_src(driver) -> str | None:
+    try:
+        iframes = driver.find_elements(By.TAG_NAME, "iframe")
+        for frame in iframes:
+            src = frame.get_attribute("src") or ""
+            if not PLAYER_DOMAIN.search(src):
+                continue
+
+            log("INFO", f"Way1 — player iframe src: {src[:150]}")
+
+            # Decode the full src URL
+            decoded = unquote(src)
+            log("INFO", f"Way1 — decoded: {decoded[:200]}")
+
+            # Extract all http URLs embedded inside the decoded string
+            candidates = re.findall(r'https?://[^\s,&#\'"<>]+', decoded)
+            for url in candidates:
+                url = url.rstrip(".,;)")
+                log("INFO", f"Way1 — candidate: {url[:120]}")
+                if is_real_video_url(url):
+                    log("HIT", f"Way1 iframe src decode: {url[:120]}")
+                    return url
+
+    except Exception as e:
+        log("WARN", f"Way1 error: {e}")
+    return None
+
+
+# ─── WAY 2: READ XHR/FETCH RESPONSE FROM INSIDE PLAYER IFRAME ────────────────
+# After clicking play, switch into player iframe and read window.__cdn_urls
+# which was populated by the response tracker injected via CDP.
+
+def way2_read_response_from_iframe(driver) -> str | None:
+    try:
+        iframes = driver.find_elements(By.TAG_NAME, "iframe")
+        for frame in iframes:
+            src = frame.get_attribute("src") or ""
+            if not PLAYER_DOMAIN.search(src):
+                continue
+
+            driver.switch_to.frame(frame)
+            log("INFO", "Way2 — switched into player iframe")
+
+            try:
+                raw = driver.execute_script("return window.__cdn_urls || [];")
+                for item in (raw or []):
+                    url = item.get("url", "") if isinstance(item, dict) else str(item)
+                    via = item.get("via", "?") if isinstance(item, dict) else "?"
+                    ct  = item.get("ct",  "") if isinstance(item, dict) else ""
+                    st  = item.get("status", 0) if isinstance(item, dict) else 0
+                    log("INFO", f"Way2 — response [{st}][{via}] ct={ct[:30]} url={url[:80]}")
+                    if is_real_video_url(url):
+                        log("HIT", f"Way2 XHR/fetch response: {url[:120]}")
+                        driver.switch_to.default_content()
+                        return url
+            finally:
+                driver.switch_to.default_content()
+
+    except Exception as e:
+        log("WARN", f"Way2 error: {e}")
+        try:
+            driver.switch_to.default_content()
+        except Exception:
+            pass
+    return None
 
 
 # ─── COOKIE LOADER ────────────────────────────────────────────────────────────
@@ -187,177 +250,17 @@ PLAY_SELECTORS = [
 ]
 
 
-def click_play_fast(driver) -> bool:
+def click_play(driver) -> bool:
     for sel in PLAY_SELECTORS:
         try:
             btn = WebDriverWait(driver, 3).until(
                 EC.presence_of_element_located((By.CSS_SELECTOR, sel))
             )
             driver.execute_script("arguments[0].click();", btn)
-            log("HIT", f"Clicked: {sel!r}")
+            log("HIT", f"Clicked play: {sel!r}")
             return True
         except Exception:
             continue
-    return False
-
-
-def js_force_play(driver, label="fallback") -> None:
-    try:
-        driver.execute_script("""
-            document.querySelectorAll('video').forEach(function(v) {
-                v.muted = false; v.volume = 1;
-                v.play().catch(function(){});
-            });
-            document.querySelectorAll('.play-btn,[class*="play-btn"]').forEach(function(el) {
-                el.dispatchEvent(new MouseEvent('click',{bubbles:true,cancelable:true}));
-            });
-        """)
-        log("INFO", f"JS force-play [{label}]")
-    except Exception as e:
-        log("WARN", f"force-play failed: {e}")
-
-
-# ─── READ TRACKER FROM A SPECIFIC FRAME ───────────────────────────────────────
-
-def read_tracker_in_current_frame(driver) -> list[str]:
-    """Read window.__vid_urls from whatever frame the driver is currently in."""
-    try:
-        raw = driver.execute_script("return window.__vid_urls || [];")
-        urls = []
-        for item in (raw or []):
-            url = item.get("url", "") if isinstance(item, dict) else str(item)
-            typ = item.get("type", "?") if isinstance(item, dict) else "?"
-            if url and is_real_video_url(url) and url not in urls:
-                urls.append(url)
-                log("HIT", f"Tracker [{typ}]: {url[:100]}")
-        return urls
-    except Exception as e:
-        log("WARN", f"Tracker read error: {e}")
-        return []
-
-
-# ─── COLLECT URLS — SCOPED TO PLAYER IFRAME ONLY ─────────────────────────────
-
-def collect_urls(driver) -> list[str]:
-    """
-    Three sources, all scoped to player.hanime.tv iframe only:
-
-    1. JS tracker inside player iframe  — catches XHR/fetch/src for the real stream
-    2. <video>.currentSrc inside iframe — what's actually loaded (skip blob: URLs)
-    3. Main page tracker                — fallback if player is not in an iframe
-
-    Ad iframes (adtng.com etc.) are completely ignored.
-    """
-    all_urls = []
-
-    # ── Find the hanime player iframe ─────────────────────────────────────────
-    player_frame_index = None
-    try:
-        iframes = driver.find_elements(By.TAG_NAME, "iframe")
-        for i, frame in enumerate(iframes):
-            src = frame.get_attribute("src") or ""
-            log("INFO", f"  iframe[{i}] src={src[:80]}")
-            if PLAYER_DOMAIN.search(src):
-                player_frame_index = i
-                log("INFO", f"  → Player iframe found at index {i}")
-                break
-    except Exception as e:
-        log("WARN", f"iframe scan error: {e}")
-
-    # ── Switch into player iframe and extract ─────────────────────────────────
-    if player_frame_index is not None:
-        try:
-            iframes = driver.find_elements(By.TAG_NAME, "iframe")
-            driver.switch_to.frame(iframes[player_frame_index])
-            log("INFO", "Switched into player iframe")
-
-            # Source 1: JS tracker (XHR/fetch/src inside the player)
-            for u in read_tracker_in_current_frame(driver):
-                if u not in all_urls:
-                    all_urls.append(u)
-
-            # Source 2: <video>.currentSrc inside player iframe
-            try:
-                videos = driver.execute_script("""
-                    var r = [];
-                    document.querySelectorAll('video').forEach(function(v) {
-                        var u = v.currentSrc || v.src || '';
-                        var d = isNaN(v.duration) ? 0 : v.duration;
-                        r.push({url: u, duration: d, readyState: v.readyState, paused: v.paused});
-                    });
-                    return r;
-                """)
-                for v in (videos or []):
-                    url = v.get("url", "")
-                    log("INFO", f"  player<video> paused={v.get('paused')} "
-                                f"rs={v.get('readyState')} dur={v.get('duration',0):.1f}s "
-                                f"src={url[:80]}")
-                    if is_real_video_url(url) and url not in all_urls:
-                        all_urls.append(url)
-                        log("HIT", f"Player video src: {url[:100]}")
-            except Exception as e:
-                log("WARN", f"player video read error: {e}")
-
-            # Source 3: nested iframes inside player (some players double-wrap)
-            try:
-                nested = driver.find_elements(By.TAG_NAME, "iframe")
-                for j, nframe in enumerate(nested):
-                    try:
-                        driver.switch_to.frame(nframe)
-                        for u in read_tracker_in_current_frame(driver):
-                            if u not in all_urls:
-                                all_urls.append(u)
-                        driver.switch_to.parent_frame()
-                    except Exception:
-                        driver.switch_to.parent_frame()
-            except Exception:
-                pass
-
-        except Exception as e:
-            log("WARN", f"Player iframe switch error: {e}")
-        finally:
-            driver.switch_to.default_content()
-
-    # ── Fallback: read tracker on main page (if no player iframe found) ───────
-    if not all_urls:
-        log("INFO", "No player iframe found — reading main page tracker")
-        for u in read_tracker_in_current_frame(driver):
-            if u not in all_urls:
-                all_urls.append(u)
-
-    # ── Rank: m3u8 > mp4 > other ──────────────────────────────────────────────
-    ordered = (
-        [u for u in all_urls if ".m3u8" in u.lower()] +
-        [u for u in all_urls if ".mp4"  in u.lower()] +
-        [u for u in all_urls if not any(x in u.lower() for x in (".m3u8", ".mp4"))]
-    )
-    return ordered
-
-
-# ─── ALSO: inject tracker INTO player iframe after page load ─────────────────
-
-def inject_tracker_into_player_iframe(driver) -> bool:
-    """
-    The CDP Page.addScriptToEvaluateOnNewDocument covers all frames,
-    but as a belt-and-suspenders measure, also directly inject the tracker
-    JS into the player iframe after it's loaded.
-    """
-    try:
-        iframes = driver.find_elements(By.TAG_NAME, "iframe")
-        for i, frame in enumerate(iframes):
-            src = frame.get_attribute("src") or ""
-            if PLAYER_DOMAIN.search(src):
-                driver.switch_to.frame(frame)
-                driver.execute_script(TRACKER_JS)
-                log("INFO", f"Tracker injected into player iframe[{i}]")
-                driver.switch_to.default_content()
-                return True
-    except Exception as e:
-        log("WARN", f"iframe tracker inject error: {e}")
-        try:
-            driver.switch_to.default_content()
-        except Exception:
-            pass
     return False
 
 
@@ -365,20 +268,24 @@ def inject_tracker_into_player_iframe(driver) -> bool:
 
 def scrape_video_url(page_url: str) -> dict:
     log("INFO", f"Scraping: {page_url}")
-    result = {"title": "Unknown", "stream_url": None, "download_urls": [], "error": None}
+    result = {"title": "Unknown", "stream_url": None, "error": None}
     driver = build_driver()
 
     try:
-        # Inject tracker into ALL frames before any page loads
-        # (covers both main page and any iframes that load later)
-        driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": TRACKER_JS})
-        log("INFO", "Tracker pre-injected via CDP (covers all frames)")
+        # Inject response tracker into ALL frames before any page JS runs
+        # This covers the player iframe so it captures XHR/fetch responses from frame 0
+        driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument",
+                                {"source": RESPONSE_TRACKER_JS})
+        log("INFO", "Response tracker injected via CDP")
 
-        # Load cookies first
+        # Load cookies for login
         load_cookies(driver, COOKIES_FILE)
 
-        # Re-inject after cookie navigation, then go to video page
-        driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": TRACKER_JS})
+        # Re-inject after cookie navigation
+        driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument",
+                                {"source": RESPONSE_TRACKER_JS})
+
+        # Navigate to video page
         driver.get(page_url)
         WebDriverWait(driver, 20).until(
             lambda d: d.execute_script("return document.readyState") in ("interactive", "complete")
@@ -399,11 +306,17 @@ def scrape_video_url(page_url: str) -> dict:
             r'\s*[-|]\s*hanime\.tv.*$', '', result["title"], flags=re.IGNORECASE
         ).strip()
 
+        # Scroll into view
         driver.execute_script("window.scrollBy(0, window.innerHeight * 0.3);")
         time.sleep(0.3)
 
-        # ── Wait for player iframe to appear ──────────────────────────────────
-        log("INFO", "Waiting for player iframe...")
+        # ── STEP 1: Click play button ─────────────────────────────────────────
+        log("INFO", "Clicking play button...")
+        if not click_play(driver):
+            log("WARN", "Play button not found")
+
+        # ── STEP 2: Wait for player iframe to load ────────────────────────────
+        log("INFO", "Waiting for player iframe to load...")
         try:
             WebDriverWait(driver, 10).until(
                 lambda d: any(
@@ -411,65 +324,37 @@ def scrape_video_url(page_url: str) -> dict:
                     for f in d.find_elements(By.TAG_NAME, "iframe")
                 )
             )
-            log("INFO", "Player iframe ready")
+            log("INFO", "Player iframe loaded")
         except Exception:
-            log("WARN", "Player iframe not found within 10s — continuing anyway")
+            log("WARN", "Player iframe wait timed out")
 
-        # ── Also inject tracker directly into player iframe ───────────────────
-        inject_tracker_into_player_iframe(driver)
+        # ── STEP 3: WAY 1 — Extract CDN URL from iframe src (instant) ─────────
+        # The iframe src itself contains the CDN URL encoded as a parameter.
+        # This works immediately without waiting for any network response.
+        cdn_url = way1_extract_from_iframe_src(driver)
 
-        # ── Click play ────────────────────────────────────────────────────────
-        log("INFO", "Clicking play button...")
-        clicked = click_play_fast(driver)
-        if not clicked:
-            log("WARN", "Play button not found — JS force-play")
-            js_force_play(driver, label="main")
+        # ── STEP 4: WAY 2 — Read XHR/fetch response from player iframe ────────
+        # After play click, player sends request to backend → gets CDN URL back.
+        # We read it from window.__cdn_urls which our tracker populated.
+        if not cdn_url:
+            log("INFO", "Way1 found nothing — trying Way2 (XHR/fetch response)...")
+            # Give player 2s to fire its backend request and get response
+            time.sleep(2)
+            cdn_url = way2_read_response_from_iframe(driver)
 
-        # ── After click: give player iframe time to fire its stream request ───
-        # The player inside player.hanime.tv will XHR/fetch the m3u8 manifest.
-        # Our tracker catches it. 2s is enough for one network round-trip.
-        time.sleep(2.0)
-
-        ordered = collect_urls(driver)
-
-        # ── Poll if not found yet (max 8s) ────────────────────────────────────
-        if not ordered:
-            log("INFO", "Polling for CDN URL (max 8s)...")
+        # ── STEP 5: Poll Way2 if still nothing (max 8s) ───────────────────────
+        if not cdn_url:
+            log("INFO", "Polling Way2 (max 8s)...")
             deadline = time.time() + 8
             while time.time() < deadline:
-                time.sleep(0.8)
-                ordered = collect_urls(driver)
-                if ordered:
-                    log("HIT", f"Got URL after polling")
+                time.sleep(1)
+                cdn_url = way2_read_response_from_iframe(driver)
+                if cdn_url:
                     break
 
-        # ── Final fallback ────────────────────────────────────────────────────
-        if not ordered:
-            log("INFO", "Final fallback: JS force-play inside player iframe + 4s")
-            try:
-                iframes = driver.find_elements(By.TAG_NAME, "iframe")
-                for frame in iframes:
-                    if PLAYER_DOMAIN.search(frame.get_attribute("src") or ""):
-                        driver.switch_to.frame(frame)
-                        driver.execute_script("""
-                            document.querySelectorAll('video').forEach(function(v) {
-                                v.muted=false; v.volume=1; v.play().catch(function(){});
-                            });
-                        """)
-                        driver.switch_to.default_content()
-                        break
-            except Exception:
-                driver.switch_to.default_content()
-                js_force_play(driver, label="fallback")
-
-            time.sleep(4)
-            ordered = collect_urls(driver)
-
-        result["stream_url"]    = ordered[0] if ordered else None
-        result["download_urls"] = ordered
-        log("INFO", f"Done — {len(ordered)} URL(s) | Title: {result['title']!r}")
-        for u in ordered:
-            log("INFO", f"  > {u[:120]}")
+        result["stream_url"] = cdn_url
+        log("INFO", f"Done — URL: {cdn_url[:100] if cdn_url else 'NOT FOUND'}")
+        log("INFO", f"Title: {result['title']!r}")
 
     except Exception as e:
         result["error"] = str(e)
@@ -484,6 +369,8 @@ def scrape_video_url(page_url: str) -> dict:
 
 
 # ─── YT-DLP DOWNLOADER ────────────────────────────────────────────────────────
+# yt-dlp is ONLY used for downloading the CDN URL we already found above.
+# It does NOT do any URL extraction/scraping.
 
 async def download_with_ytdlp(
     cdn_url: str, title: str, session_id: str, status_msg: Message
@@ -557,51 +444,42 @@ async def dl_cmd(client: Client, message: Message):
         await message.reply_text("❌ Only hanime.tv URLs are supported.", parse_mode=PM)
         return
 
-    status = await message.reply_text("🌐 Launching Chrome...", parse_mode=PM)
+    status = await message.reply_text("🌐 Launching browser...", parse_mode=PM)
 
     try:
         loop = asyncio.get_event_loop()
         data = await asyncio.wait_for(
-            loop.run_in_executor(None, scrape_video_url, url), timeout=180
+            loop.run_in_executor(None, scrape_video_url, url), timeout=120
         )
     except asyncio.TimeoutError:
-        await status.edit_text("❌ Timed out after 3 minutes.", parse_mode=PM)
+        await status.edit_text("❌ Timed out.", parse_mode=PM)
         return
     except Exception as e:
-        await status.edit_text(f"❌ Scraper crashed:\n<code>{html_esc(e)}</code>", parse_mode=PM)
+        await status.edit_text(f"❌ Error:\n<code>{html_esc(e)}</code>", parse_mode=PM)
         return
 
     if data.get("error"):
         await status.edit_text(f"❌ Error:\n<code>{html_esc(data['error'])}</code>", parse_mode=PM)
         return
 
-    stream_url = data["stream_url"]
-    title      = data["title"]
-    all_urls   = data["download_urls"]
+    cdn_url = data["stream_url"]
+    title   = data["title"]
 
-    if not stream_url:
-        await status.edit_text("❌ No video URL found. Login may be required.", parse_mode=PM)
+    if not cdn_url:
+        await status.edit_text("❌ No CDN URL found. Login may be required.", parse_mode=PM)
         return
 
     await status.edit_text(
-        f"✅ Found <b>{len(all_urls)}</b> URL(s)\n"
-        f"<b>Title:</b> {html_esc(title)}\n\n⬇️ Downloading...",
+        f"✅ Found CDN URL\n<b>Title:</b> {html_esc(title)}\n\n⬇️ Downloading...",
         parse_mode=PM,
     )
 
     session_id = str(uuid.uuid4())
-    file_path  = None
-
-    for i, u in enumerate(all_urls, 1):
-        file_path = await download_with_ytdlp(u, title, session_id, status)
-        if file_path and os.path.exists(file_path):
-            break
-        if i < len(all_urls):
-            await status.edit_text(f"⚠️ URL #{i} failed, trying #{i+1}...", parse_mode=PM)
+    file_path = await download_with_ytdlp(cdn_url, title, session_id, status)
 
     if not file_path or not os.path.exists(file_path):
         await status.edit_text(
-            f"❌ Download failed.\n\nStream URL:\n<code>{html_esc(stream_url)}</code>",
+            f"❌ Download failed.\n\nCDN URL:\n<code>{html_esc(cdn_url)}</code>",
             parse_mode=PM,
         )
         return
