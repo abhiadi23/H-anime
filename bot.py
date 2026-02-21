@@ -707,14 +707,9 @@ async def download_with_ytdlp(
         "--format", "bestvideo+bestaudio/best",
         "--merge-output-format", "mp4",
         "--no-playlist",
-        # Retry aggressively on stalled fragments
-        "--retries", "10",
+        "--retries", "5",
         "--fragment-retries", "10",
-        "--retry-sleep", "3",
-        # Lower concurrency to avoid CDN throttling/stalls on last fragments
-        "--concurrent-fragments", "2",
-        # Kill and retry a fragment if it stalls for >30s
-        "--socket-timeout", "30",
+        "--concurrent-fragments", "4",
         "--newline", "--progress", "--no-warnings",
         "--add-header", "Referer:https://hanime.tv/",
         "--add-header",
@@ -726,21 +721,9 @@ async def download_with_ytdlp(
         *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
     )
 
-    last_update  = time.time()
-    last_progress = time.time()
-    last_line    = ""
-
+    last_update = time.time()
     async for raw in process.stdout:
         line = raw.decode("utf-8", errors="ignore").strip()
-        if not line:
-            continue
-
-        # Track last progress timestamp to detect stalls
-        if "[download]" in line and "%" in line:
-            last_progress = time.time()
-            last_line = line
-
-        # Update Telegram status every 5s
         if "[download]" in line and time.time() - last_update > 5:
             try:
                 await status_msg.edit_text(f"⬇️ Downloading...\n\n{line}")
@@ -748,12 +731,8 @@ async def download_with_ytdlp(
             except Exception:
                 pass
 
-        # Log all yt-dlp output for debugging
-        log("YTDL", line[:120])
-
     await process.wait()
     if process.returncode != 0:
-        log("WARN", f"yt-dlp exited with code {process.returncode}")
         return None
 
     files = sorted(
