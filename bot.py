@@ -95,7 +95,7 @@ def build_driver():
 # Tracks ONLY src assignments on HTMLMediaElement and XHR/fetch calls.
 # We read this after clicking play to get exactly what the player requested.
 
-TRACKER_JS = """
+TRACKER_JS = r"""
 window.__vid_urls = [];
 
 // 1. Intercept video.src = "..." assignments
