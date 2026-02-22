@@ -23,7 +23,7 @@ def html_esc(text: str) -> str:
 
 
 PM  = enums.ParseMode.HTML
-app = Client("hanime_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+app = Client("hanime_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, plugins={"root": "Plugins"})
 
 
 def log(level: str, msg: str) -> None:
