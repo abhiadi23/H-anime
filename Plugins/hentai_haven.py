@@ -42,19 +42,10 @@ class VideoScraper:
             'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
         )
         
-        # FIXED: Wrap in try-except to handle compatibility issues
-        try:
-            options.add_experimental_option("excludeSwitches", ["enable-automation"])
-            options.add_experimental_option('useAutomationExtension', False)
-        except Exception as e:
-            logging.warning(f"Could not set experimental options: {e}")
+        # REMOVED: Don't set experimental options - they're causing compatibility issues
+        # The undetected_chromedriver handles these internally
 
-        # Enable performance logging
-        try:
-            options.set_capability('goog:loggingPrefs', {'performance': 'ALL', 'browser': 'ALL'})
-        except Exception as e:
-            logging.warning(f"Could not set logging preferences: {e}")
-
+        # Create driver without problematic options
         self.driver = uc.Chrome(options=options, version_main=120)
         self.driver.set_page_load_timeout(30)
 
@@ -63,7 +54,7 @@ class VideoScraper:
             "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
         )
 
-        # Enable network tracking
+        # Enable network tracking AFTER driver creation
         try:
             self.driver.execute_cdp_cmd('Network.enable', {})
             self.driver.execute_cdp_cmd('Performance.enable', {})
