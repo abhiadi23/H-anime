@@ -129,11 +129,23 @@ class VideoScraper:
             # **STEP 2: Find play button (don't click yet)**
             logging.info("🎬 Step 1: Finding play button...")
             play_selectors = [
-                ".vjs-big-play-button", ".vjs-play-control", ".plyr__control--play",
-                ".play-button", "[aria-label*='play']", "[data-purpose='PLAY']",
-                "button[title*='play']", ".video-play-button", ".play"
+                # --- Framework Specific (Video.js, Plyr, JWPlayer) ---
+                ".vjs-big-play-button", ".vjs-play-control", ".plyr__control--play", 
+                ".jw-icon-playback", ".mejs-playpause-button", ".flowplayer .fp-play",
+                # --- Major Platforms (YouTube, Twitch, Netflix, Hulu) ---
+                ".ytp-play-button", ".tp-playbutton", "[data-a-target='player-play-pause-button']",
+                ".watch-video--player-controls-play", ".button-play", ".player-control-play",
+                # --- Attribute & Accessibility Based (Most Reliable) ---
+                "[aria-label*='Play']", "[aria-label*='play']", "[aria-label*='Reproducir']", # Multilingual
+                "button[title*='Play']", "button[title*='play']",
+                "[data-purpose*='play']", "[data-purpose*='PLAY']",
+                "[data-testid*='play']", "[data-qa*='play-button']",
+                # --- Generic Class Names ---
+                ".play-button", ".video-play-button", ".play-btn", ".play-icon", 
+                ".play", ".player-play", ".btn-play", ".play_button",
+                # --- Icon & SVG Based ---
+                ".fa-play", ".svg-play", "[class*='play-icon']", "svg[class*='play']"
             ]
-            
             play_button = None
             wait = WebDriverWait(self.driver, 8)
             
