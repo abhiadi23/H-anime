@@ -46,7 +46,7 @@ class VideoScraper:
         # The undetected_chromedriver handles these internally
 
         # Create driver without problematic options
-        self.driver = uc.Chrome(options=options, version_main=120)
+        self.driver = uc.Chrome(options=options)
         self.driver.set_page_load_timeout(30)
 
         # Anti-detection
