@@ -366,19 +366,41 @@ class VideoScraper:
             time.sleep(3)  # Let network requests complete
             
             video_urls = self.get_video_urls_from_network()
-
-            # Prioritize m3u8 > mp4
-            m3u8_urls = [u for u in video_urls if '.m3u8' in u.lower()]
-            if m3u8_urls:
-                # Get the longest URL (usually master playlist)
-                best_url = max(m3u8_urls, key=len)
-                logging.info(f"✅ Found m3u8: {best_url[:80]}...")
-                return best_url
             
-            mp4_urls = [u for u in video_urls if '.mp4' in u.lower()]
+            if video_urls:
+                logging.info(f"📋 All found URLs:")
+                for idx, u in enumerate(video_urls, 1):
+                    logging.info(f"  {idx}. {u[:100]}...")
+
+            # Prioritize URLs by quality:
+            # 1. Direct mp4 URLs (best)
+            # 2. m3u8 variant playlists (with resolution like 1080p, 720p)
+            # 3. m3u8 master playlists (last resort)
+            
+            # Get mp4 URLs
+            mp4_urls = [u for u in video_urls if '.mp4' in u.lower() and 'manifest' not in u.lower()]
+            
+            # Get m3u8 URLs with quality indicators
+            quality_m3u8 = [u for u in video_urls if '.m3u8' in u.lower() and 
+                           any(q in u.lower() for q in ['1080p', '720p', '480p', '360p', 'high', 'medium', 'low'])]
+            
+            # Get other m3u8 URLs
+            other_m3u8 = [u for u in video_urls if '.m3u8' in u.lower() and u not in quality_m3u8]
+            
+            # Try in priority order
             if mp4_urls:
-                logging.info(f"✅ Found mp4: {mp4_urls[0][:80]}...")
-                return mp4_urls[0]
+                best_url = mp4_urls[0]
+                logging.info(f"✅ Found direct mp4: {best_url[:80]}...")
+                return best_url
+            elif quality_m3u8:
+                # Prefer highest quality
+                best_url = max(quality_m3u8, key=len)
+                logging.info(f"✅ Found quality m3u8: {best_url[:80]}...")
+                return best_url
+            elif other_m3u8:
+                best_url = max(other_m3u8, key=len)
+                logging.info(f"✅ Found master m3u8: {best_url[:80]}...")
+                return best_url
 
             # Fallback: DOM check
             logging.info("🔍 Fallback: Checking DOM...")
@@ -402,20 +424,118 @@ class VideoScraper:
 
 
 async def download_video(url: str, filename: str, status_msg=None):
+    """Download video - handles both direct mp4 and m3u8 streams"""
     try:
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Referer': 'https://hentaihaven.com/'
+            'Referer': 'https://hentaihaven.com/',
+            'Origin': 'https://hentaihaven.com'
         }
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=1800)) as resp:
-                with open(filename, 'wb') as f:
-                    async for chunk in resp.content.iter_chunked(1024*1024):
-                        f.write(chunk)
-        logging.info(f"✅ Download complete: {filename}")
-        return True
+        
+        # Check if it's m3u8 (HLS stream)
+        if '.m3u8' in url.lower():
+            logging.info("🎬 Detected m3u8 stream, using ffmpeg...")
+            return await download_m3u8_with_ffmpeg(url, filename, headers)
+        else:
+            # Direct mp4 download
+            logging.info("📥 Direct download...")
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=1800)) as resp:
+                    if resp.status != 200:
+                        logging.error(f"❌ HTTP {resp.status}: {await resp.text()}")
+                        return False
+                    
+                    with open(filename, 'wb') as f:
+                        async for chunk in resp.content.iter_chunked(1024*1024):
+                            f.write(chunk)
+            
+            logging.info(f"✅ Download complete: {filename}")
+            return True
+            
     except Exception as e:
         logging.error(f"❌ Download error: {e}")
+        return False
+
+
+async def download_m3u8_with_ffmpeg(url: str, filename: str, headers: dict):
+    """Download m3u8 stream using ffmpeg"""
+    try:
+        import subprocess
+        
+        # Build ffmpeg command
+        cmd = [
+            'ffmpeg',
+            '-hide_banner',
+            '-loglevel', 'warning',
+            '-headers', f"Referer: {headers['Referer']}\\r\\nUser-Agent: {headers['User-Agent']}",
+            '-i', url,
+            '-c', 'copy',  # Copy without re-encoding (faster)
+            '-bsf:a', 'aac_adtstoasc',  # Fix audio
+            '-y',  # Overwrite output
+            filename
+        ]
+        
+        logging.info(f"🎬 Running ffmpeg...")
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        
+        stdout, stderr = await process.communicate()
+        
+        if process.returncode == 0:
+            logging.info("✅ m3u8 download complete")
+            return True
+        else:
+            error_msg = stderr.decode() if stderr else "Unknown error"
+            logging.error(f"❌ ffmpeg error: {error_msg}")
+            
+            # Fallback: Try yt-dlp if ffmpeg fails
+            return await download_m3u8_with_ytdlp(url, filename, headers)
+            
+    except FileNotFoundError:
+        logging.warning("⚠️ ffmpeg not found, trying yt-dlp...")
+        return await download_m3u8_with_ytdlp(url, filename, headers)
+    except Exception as e:
+        logging.error(f"❌ ffmpeg error: {e}")
+        return await download_m3u8_with_ytdlp(url, filename, headers)
+
+
+async def download_m3u8_with_ytdlp(url: str, filename: str, headers: dict):
+    """Fallback: Download m3u8 using yt-dlp"""
+    try:
+        import subprocess
+        
+        cmd = [
+            'yt-dlp',
+            '--no-warnings',
+            '--quiet',
+            '--add-header', f"Referer: {headers['Referer']}",
+            '--add-header', f"User-Agent: {headers['User-Agent']}",
+            '--output', filename,
+            url
+        ]
+        
+        logging.info("🎬 Running yt-dlp...")
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        
+        stdout, stderr = await process.communicate()
+        
+        if process.returncode == 0:
+            logging.info("✅ yt-dlp download complete")
+            return True
+        else:
+            error_msg = stderr.decode() if stderr else "Unknown error"
+            logging.error(f"❌ yt-dlp error: {error_msg}")
+            return False
+            
+    except Exception as e:
+        logging.error(f"❌ yt-dlp error: {e}")
         return False
 
 
