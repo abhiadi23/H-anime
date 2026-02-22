@@ -157,34 +157,101 @@ class VideoScraper:
             return None
 
     def find_and_prepare_play_button(self):
-        """Find play button without clicking (faster approach)"""
+        """Find play button without clicking (faster approach with iframe support)"""
         try:
-            # Prioritized selectors (most common first)
-            priority_selectors = [
+            # First check if there's an iframe (common for video players)
+            iframes = self.driver.find_elements(By.TAG_NAME, 'iframe')
+            
+            # Comprehensive selector list
+            all_selectors = [
+                # Video.js (most common)
+                ".vjs-big-play-button",
+                ".vjs-play-control",
+                "button.vjs-big-play-button",
+                
+                # Aria labels (accessibility)
                 "button[aria-label*='Play']",
                 "button[aria-label*='play']",
-                ".vjs-big-play-button",
+                "[aria-label*='Play' i]",
+                
+                # Generic classes
+                ".play-button",
+                ".play-btn",
+                ".player-play-button",
                 "[class*='play-button']",
                 "[class*='play-btn']",
-                "button[title*='Play']",
-                ".plyr__control--play"
+                "[class*='PlayButton']",
+                
+                # Plyr
+                ".plyr__control--play",
+                "button.plyr__control[data-plyr='play']",
+                
+                # JW Player
+                ".jw-icon-playback",
+                ".jw-display-icon-container",
+                
+                # Title/data attributes
+                "button[title*='Play' i]",
+                "button[data-purpose*='play' i]",
+                "button[data-testid*='play' i]",
+                
+                # SVG/Icon based
+                "button svg[class*='play']",
+                "button .fa-play",
+                
+                # Generic buttons near video
+                "button[class*='video']",
+                ".video-overlay button"
             ]
             
-            # Try priority selectors first with short timeout
-            for selector in priority_selectors:
+            # Try in main document first
+            for selector in all_selectors:
                 try:
                     elements = self.driver.find_elements(By.CSS_SELECTOR, selector)
-                    if elements:
-                        logging.info(f"✅ Found play button: {selector}")
-                        return elements[0]
+                    for elem in elements:
+                        # Check if element is visible and interactable
+                        if elem.is_displayed() and elem.is_enabled():
+                            logging.info(f"✅ Found play button: {selector}")
+                            return elem
                 except:
                     continue
             
-            # Fallback: look for any clickable video element
+            # Try inside iframes if no button found
+            for idx, iframe in enumerate(iframes):
+                try:
+                    self.driver.switch_to.frame(iframe)
+                    logging.info(f"🔍 Checking iframe {idx+1}/{len(iframes)}")
+                    
+                    for selector in all_selectors:
+                        try:
+                            elements = self.driver.find_elements(By.CSS_SELECTOR, selector)
+                            for elem in elements:
+                                if elem.is_displayed() and elem.is_enabled():
+                                    logging.info(f"✅ Found play button in iframe: {selector}")
+                                    return elem
+                        except:
+                            continue
+                    
+                    # Check for video in iframe
+                    try:
+                        video = self.driver.find_element(By.TAG_NAME, 'video')
+                        if video.is_displayed():
+                            logging.info(f"✅ Found video in iframe {idx+1}")
+                            return video
+                    except:
+                        pass
+                    
+                    self.driver.switch_to.default_content()
+                except:
+                    self.driver.switch_to.default_content()
+                    continue
+            
+            # Final fallback: video element in main document
             try:
                 video = self.driver.find_element(By.TAG_NAME, 'video')
-                logging.info("✅ Found video element (will click directly)")
-                return video
+                if video.is_displayed():
+                    logging.info("✅ Found video element (will click directly)")
+                    return video
             except:
                 pass
             
@@ -193,6 +260,7 @@ class VideoScraper:
             
         except Exception as e:
             logging.error(f"Error finding play button: {e}")
+            self.driver.switch_to.default_content()  # Ensure we're back to main frame
             return None
 
     def _scrape_blocking(self, url: str):
@@ -209,6 +277,14 @@ class VideoScraper:
 
             # **STEP 2: Find play button (don't click yet)**
             logging.info("🎬 Step 1: Finding play button...")
+            
+            # Optional: Take screenshot for debugging (disable in production)
+            # try:
+            #     self.driver.save_screenshot('/tmp/page_before_play.png')
+            #     logging.info("📸 Screenshot saved")
+            # except:
+            #     pass
+            
             play_button = self.find_and_prepare_play_button()
 
             # **STEP 3: Nuke ads FIRST (before clicking)**
@@ -218,6 +294,8 @@ class VideoScraper:
 
             # **STEP 4: Click play button**
             logging.info("🎬 Step 3: Clicking play button...")
+            play_clicked = False
+            
             if play_button:
                 try:
                     # Scroll into view
@@ -231,21 +309,49 @@ class VideoScraper:
                     try:
                         play_button.click()
                         logging.info("✅ Play button clicked (standard)")
-                    except:
-                        self.driver.execute_script("arguments[0].click();", play_button)
-                        logging.info("✅ Play button clicked (JS)")
+                        play_clicked = True
+                    except Exception as e1:
+                        try:
+                            self.driver.execute_script("arguments[0].click();", play_button)
+                            logging.info("✅ Play button clicked (JS)")
+                            play_clicked = True
+                        except Exception as e2:
+                            logging.warning(f"⚠️ Both clicks failed: {e1}, {e2}")
+                    
+                    # Switch back to main content if we were in iframe
+                    self.driver.switch_to.default_content()
+                    
                 except Exception as e:
-                    logging.warning(f"⚠️ Click failed: {e}, trying video.play()")
-                    self.driver.execute_script("document.querySelector('video')?.play();")
-            else:
-                # Fallback: force play via JS
-                logging.info("⚠️ No button, using JS play fallback")
+                    logging.warning(f"⚠️ Click error: {e}")
+                    self.driver.switch_to.default_content()
+            
+            # Fallback: force play via JS if button click didn't work
+            if not play_clicked:
+                logging.info("⚠️ Using JS play fallback")
+                # Try in main frame
                 self.driver.execute_script("""
                     const video = document.querySelector('video');
                     if (video) {
                         video.muted = true;
                         video.play();
+                        console.log('Video play attempted (main)');
                     }
+                """)
+                
+                # Also try in iframes
+                self.driver.execute_script("""
+                    const iframes = document.querySelectorAll('iframe');
+                    iframes.forEach(iframe => {
+                        try {
+                            const iframeDoc = iframe.contentDocument || iframe.contentWindow.document;
+                            const video = iframeDoc.querySelector('video');
+                            if (video) {
+                                video.muted = true;
+                                video.play();
+                                console.log('Video play attempted (iframe)');
+                            }
+                        } catch(e) {}
+                    });
                 """)
             
             time.sleep(2)  # Wait for stream to initialize
