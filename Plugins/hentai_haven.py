@@ -11,7 +11,6 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.action_chains import ActionChains
 from selenium.common.exceptions import TimeoutException, NoSuchElementException
-from bot import app  # Assuming app is defined in bot.py
 import aiohttp
 from urllib.parse import urlparse, urljoin
 import re
