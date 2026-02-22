@@ -44,13 +44,11 @@ class VideoScraper:
             "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
             "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         )
-        return uc.Chrome(options=options)
-        # Anti-detection
-        self.driver.execute_script(
-            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
-        )
+        
+        # Create the driver
+        self.driver = uc.Chrome(options=options)
 
-        # Enable network tracking AFTER driver creation
+        # Enable network tracking
         try:
             self.driver.execute_cdp_cmd('Network.enable', {})
             self.driver.execute_cdp_cmd('Performance.enable', {})
@@ -59,6 +57,7 @@ class VideoScraper:
             logging.warning(f"Could not enable network tracking: {e}")
         
         logging.info("✅ Driver setup complete")
+        return self.driver
 
     def close_driver(self):
         """Close the driver safely"""
@@ -200,10 +199,10 @@ class VideoScraper:
         try:
             page_source = self.driver.page_source
             patterns = [
-                r'https?://[^\s"\'<>]+\.m3u8[^\s"\'<>]*',
-                r'https?://[^\s"\'<>]+\.mp4[^\s"\'<>]*',
-                r'"file"\s*:\s*"([^"]+)"',
-                r'"src"\s*:\s*"([^"]+\.(?:mp4|m3u8)[^"]*)"',
+                r'https?://[^\\s"\'<>]+\\.m3u8[^\\s"\'<>]*',
+                r'https?://[^\\s"\'<>]+\\.mp4[^\\s"\'<>]*',
+                r'"file"\\s*:\\s*"([^"]+)"',
+                r'"src"\\s*:\\s*"([^"]+\\.(?:mp4|m3u8)[^"]*)"',
             ]
 
             for pattern in patterns:
@@ -229,10 +228,16 @@ class VideoScraper:
         """
         try:
             self.setup_driver()
+            
+            # SAFETY CHECK
+            if self.driver is None:
+                logging.error("❌ Driver setup failed - driver is None")
+                return None
+                
             logging.info(f"🌐 Loading page: {url}")
             self.driver.get(url)
 
-            # Step 1: Wait for page load (reduced from 5s to 3s)
+            # Step 1: Wait for page load
             logging.info("⏳ Waiting for page to load...")
             time.sleep(3)
             
@@ -270,7 +275,7 @@ class VideoScraper:
                         arguments[0].style.position = 'relative';
                     """, play_btn)
                     
-                    # Click using JavaScript (more reliable)
+                    # Click using JavaScript
                     self.driver.execute_script("arguments[0].click();", play_btn)
                     logging.info(f"✅ Clicked play button: {selector}")
                     play_clicked = True
@@ -292,11 +297,11 @@ class VideoScraper:
                     }
                 """)
 
-            # Step 4: Wait for video stream to initialize (reduced from 12s to 8s)
+            # Step 4: Wait for video stream to initialize
             logging.info("⏳ Step 3: Waiting for video stream to start...")
             time.sleep(8)
 
-            # Step 5: Second ad removal (after play)
+            # Step 5: Second ad removal
             logging.info("💣 Step 4: Nuking ads again after play...")
             self.remove_all_overlays()
 
@@ -308,7 +313,6 @@ class VideoScraper:
                 # Prioritize m3u8 (HLS streams)
                 m3u8_urls = [u for u in video_urls if '.m3u8' in u.lower()]
                 if m3u8_urls:
-                    # Pick the longest URL (usually the master playlist)
                     best_url = max(m3u8_urls, key=len)
                     logging.info(f"✅ Found m3u8 CDN link: {best_url[:100]}...")
                     return best_url
@@ -346,7 +350,6 @@ class VideoScraper:
     async def scrape_video_url(self, url: str):
         """
         Async wrapper - offloads blocking Selenium work to a thread executor
-        so the Telegram event loop is never blocked and the bot stays responsive.
         """
         loop = asyncio.get_event_loop()
         video_url = await loop.run_in_executor(None, self._scrape_blocking, url)
@@ -356,7 +359,6 @@ class VideoScraper:
 async def download_video(url: str, filename: str, status_msg: Message = None):
     """
     Async video downloader using aiohttp.
-    Replaces the old blocking requests.get() call.
     """
     try:
         headers = {
@@ -394,8 +396,8 @@ async def download_video(url: str, filename: str, status_msg: Message = None):
                                     size_info = f"{downloaded / (1024*1024):.1f}MB"
 
                                 await status_msg.edit_text(
-                                    f"⬇️ **Downloading...**\n\n"
-                                    f"Progress: {progress:.1f}%\n"
+                                    f"⬇️ **Downloading...**\\n\\n"
+                                    f"Progress: {progress:.1f}%\\n"
                                     f"Downloaded: {size_info}"
                                 )
                                 last_update = downloaded
@@ -418,9 +420,9 @@ async def download_command(client: Client, message: Message):
         # Extract URL from command
         if len(message.command) < 2:
             await message.reply_text(
-                "❌ **Missing URL!**\n\n"
-                "**Usage:** `/dl2 <url>`\n\n"
-                "**Example:**\n"
+                "❌ **Missing URL!**\\n\\n"
+                "**Usage:** `/dl2 <url>`\\n\\n"
+                "**Example:**\\n"
                 "`/dl2 https://hentaihaven.com/video/arisugawa-ren-tte-honto-wa-onn/episode-5/`"
             )
             return
@@ -435,50 +437,50 @@ async def download_command(client: Client, message: Message):
 
         status_msg = await message.reply_text("🔍 **Initializing scraper...**")
         await status_msg.edit_text(
-            "🔍 **Scraping video URL...**\n\n"
-            "**Process:**\n"
-            "• Loading page\n"
-            "• Removing ads\n"
-            "• Clicking play button\n"
-            "• Capturing video stream\n\n"
+            "🔍 **Scraping video URL...**\\n\\n"
+            "**Process:**\\n"
+            "• Loading page\\n"
+            "• Removing ads\\n"
+            "• Clicking play button\\n"
+            "• Capturing video stream\\n\\n"
             "⏱️ This may take 30-60 seconds..."
         )
 
-        # Scrape — non-blocking thanks to run_in_executor
+        # Scrape — non-blocking
         scraper = VideoScraper()
         video_url = await scraper.scrape_video_url(url)
 
         if not video_url:
             await status_msg.edit_text(
-                "❌ **Failed to extract video URL!**\n\n"
-                "**Possible reasons:**\n"
-                "• Anti-bot protection triggered\n"
-                "• Page structure changed\n"
-                "• Video not available\n"
-                "• Network issues\n\n"
+                "❌ **Failed to extract video URL!**\\n\\n"
+                "**Possible reasons:**\\n"
+                "• Anti-bot protection triggered\\n"
+                "• Page structure changed\\n"
+                "• Video not available\\n"
+                "• Network issues\\n\\n"
                 "Check bot logs for detailed error information."
             )
             return
 
         await status_msg.edit_text(
-            f"✅ **Video URL found!**\n\n"
-            f"🔗 `{video_url[:100]}...`\n\n"
+            f"✅ **Video URL found!**\\n\\n"
+            f"🔗 `{video_url[:100]}...`\\n\\n"
             f"⬇️ **Starting download...**"
         )
 
         # Build safe filename
         parts = url.rstrip('/').split('/')
         video_title = parts[-1] if parts[-1] else parts[-2]
-        video_title = re.sub(r'[^\w\-_\.]', '_', video_title.split('?')[0])
+        video_title = re.sub(r'[^\\w\\-_\\.]', '_', video_title.split('?')[0])
         filename = f"{video_title}_{int(time.time())}.mp4"
 
-        # Download — fully async, no blocking
+        # Download — fully async
         success = await download_video(video_url, filename, status_msg)
 
         if not success or not os.path.exists(filename):
             await status_msg.edit_text(
-                f"❌ **Download failed!**\n\n"
-                f"**Direct URL:**\n`{video_url}`\n\n"
+                f"❌ **Download failed!**\\n\\n"
+                f"**Direct URL:**\\n`{video_url}`\\n\\n"
                 "Try downloading manually or check your network connection."
             )
             if os.path.exists(filename):
@@ -491,9 +493,9 @@ async def download_command(client: Client, message: Message):
 
         if file_size_mb > 2000:
             await status_msg.edit_text(
-                f"❌ **File too large!** ({file_size_mb:.1f}MB)\n\n"
-                f"Telegram limit: 2GB (2000MB)\n\n"
-                f"**Direct URL:**\n`{video_url}`\n\n"
+                f"❌ **File too large!** ({file_size_mb:.1f}MB)\\n\\n"
+                f"Telegram limit: 2GB (2000MB)\\n\\n"
+                f"**Direct URL:**\\n`{video_url}`\\n\\n"
                 "Download manually using a download manager."
             )
             os.remove(filename)
@@ -501,16 +503,16 @@ async def download_command(client: Client, message: Message):
 
         # Upload to Telegram
         await status_msg.edit_text(
-            f"📤 **Uploading to Telegram...**\n\n"
-            f"Size: {file_size_mb:.1f}MB\n\n"
+            f"📤 **Uploading to Telegram...**\\n\\n"
+            f"Size: {file_size_mb:.1f}MB\\n\\n"
             f"Please wait..."
         )
 
         await message.reply_video(
             video=filename,
             caption=(
-                f"🎬 **Downloaded Successfully!**\n\n"
-                f"📁 Size: {file_size_mb:.1f}MB\n"
+                f"🎬 **Downloaded Successfully!**\\n\\n"
+                f"📁 Size: {file_size_mb:.1f}MB\\n"
                 f"🔗 Source: {url}"
             ),
             supports_streaming=True
@@ -524,8 +526,8 @@ async def download_command(client: Client, message: Message):
         logging.error(f"❌ Download command error: {e}", exc_info=True)
         try:
             await message.reply_text(
-                f"❌ **Unexpected error occurred:**\n\n"
-                f"`{error_msg[:150]}...`\n\n"
+                f"❌ **Unexpected error occurred:**\\n\\n"
+                f"`{error_msg[:150]}...`\\n\\n"
                 f"Check bot logs for detailed information."
             )
         except Exception:
