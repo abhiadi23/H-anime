@@ -6,7 +6,6 @@ import time
 import glob
 import uuid
 from config import *
-from Plugins.hentai_haven import *
 from pyrogram import Client, filters, enums
 from pyrogram.types import Message
 from selenium.webdriver.common.by import By
