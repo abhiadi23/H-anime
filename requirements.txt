@@ -11,3 +11,4 @@ selenium-stealth
 undetected-chromedriver
 curl_cffi
 requests
+aiohttp
