@@ -337,47 +337,7 @@ async def download_video(url: str, filename: str, status_msg: Message = None):
         logging.error(f"Download error: {e}")
         return False
 
-
-# ──────────────────────────────────────────────
-#  Bot command handlers
-# ──────────────────────────────────────────────
-
-@app.on_message(filters.command("start"))
-async def start_command(client: Client, message: Message):
-    try:
-        await message.reply_text(
-            "**🎬 HentaiHaven Video Downloader Bot**\n\n"
-            "This bot can download videos from HentaiHaven.com\n\n"
-            "**Usage:**\n"
-            "`/dl2 <url>` - Download video\n\n"
-            "**Example:**\n"
-            "`/dl2 https://hentaihaven.com/video/arisugawa-ren-tte-honto-wa-onn/episode-5/`\n\n"
-            "**Note:** Large files may take time. Check logs for debugging."
-        )
-    except Exception as e:
-        logging.error(f"Start command error: {e}")
-
-
-@app.on_message(filters.command("help"))
-async def help_command(client: Client, message: Message):
-    try:
-        await message.reply_text(
-            "**📖 Help - HentaiHaven Downloader**\n\n"
-            "**Commands:**\n"
-            "• `/start` - Show welcome message\n"
-            "• `/dl2 <url>` - Download a video\n"
-            "• `/help` - Show this help message\n\n"
-            "**Supported URLs:**\n"
-            "• Direct video page links from hentaihaven.com\n\n"
-            "**Limitations:**\n"
-            "• Maximum file size: 2GB (Telegram limit)\n"
-            "• Processing time depends on video length"
-        )
-    except Exception as e:
-        logging.error(f"Help command error: {e}")
-
-
-@app.on_message(filters.command("dl2"))
+@Client.on_message(filters.command("dl2"))
 async def download_command(client: Client, message: Message):
     try:
         # Extract URL from command
